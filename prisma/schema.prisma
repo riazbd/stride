@@ -1,0 +1,401 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Athletes & social graph ────────────────────────────────────────────────
+
+model Athlete {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  password      String
+  firstName     String
+  lastName      String
+  avatarColor   String    @default("#fc4c02")
+  bio           String?
+  city          String?
+  country       String?
+  birthday      DateTime?
+  sex           String? // "M" | "F"
+  weightKg      Float?
+  heightCm      Float?
+  units         String    @default("km") // "km" | "mi"
+  theme         String    @default("system") // "system" | "light" | "dark"
+  premium       Boolean   @default(false)
+  premiumPlan   String? // "monthly" | "yearly" (mock purchase)
+  premiumSince  DateTime?
+  maxHr         Int? // max heart rate for zone analysis (default 190)
+  privacyRadiusM Int     @default(0) // hide activity start/end within this radius (0 = off)
+  defaultVisibility String @default("everyone") // default visibility for new activities
+  followerCount Int       @default(0)
+  followingCount Int      @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  activities    Activity[]
+  posts         Post[]
+  kudos         Kudos[]
+  comments      Comment[]
+  efforts       SegmentEffort[]
+  starredSegs   SegmentStar[]
+  gear          Gear[]
+  goals         Goal[]
+  routes        Route[]
+  notifications Notification[] @relation("recipient")
+  actedNotifications Notification[] @relation("actor")
+  followingRefs AthleteFollow[] @relation("follower")
+  followerRefs  AthleteFollow[] @relation("followed")
+  clubMemberships ClubMembership[]
+  eventAttendance EventAttendance[]
+  adminOf       Club[]    @relation("clubAdmin")
+  challengeEntries ChallengeEntry[]
+  sessions      Session[]
+  createdSegments Segment[] @relation("segmentCreator")
+}
+
+model AthleteFollow {
+  id         String   @id @default(cuid())
+  followerId String
+  followedId String
+  createdAt  DateTime @default(now())
+  follower   Athlete  @relation("follower", fields: [followerId], references: [id])
+  followed   Athlete  @relation("followed", fields: [followedId], references: [id])
+
+  @@unique([followerId, followedId])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  athleteId String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  athlete   Athlete  @relation(fields: [athleteId], references: [id])
+}
+
+// ─── Activities ─────────────────────────────────────────────────────────────
+
+model Activity {
+  id              String   @id @default(cuid())
+  athleteId       String
+  athlete         Athlete  @relation(fields: [athleteId], references: [id])
+  sport           String // "run" | "ride" | "trail_run" | "gravel" | "mtb" | "walk" | "hike" | "ebike" | "swim" | "row" | "ski" | "snowboard" | "kayak" | "workout" | "yoga" | "gym" | "tennis" | "football"
+  title           String?
+  description     String?
+  startDate       DateTime
+  tzOffsetMin     Int      @default(360)
+  distanceM       Float
+  movingTimeS     Int
+  elapsedTimeS    Int
+  elevationM      Float    @default(0)
+  startLat        Float?
+  startLng        Float?
+  endLat          Float?
+  endLng          Float?
+  avgSpeed        Float? // m/s
+  maxSpeed        Float?
+  avgHr           Int?
+  maxHr           Int?
+  calories        Int?
+  relativeEffort Int?
+  perceivedEffort Int? // 1..10
+  visibility      String   @default("everyone") // "everyone" | "followers" | "only_me"
+  isCommute       Boolean  @default(false)
+  isTrainer       Boolean  @default(false) // indoor / no GPS
+  gearId          String?
+  gear            Gear?    @relation(fields: [gearId], references: [id])
+  photo           String?
+  flagged         Boolean  @default(false)
+  deviceName      String   @default("STRIDE App")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  track    Track?
+  splits   Split[]
+  laps     Lap[]
+  kudos    Kudos[]
+  comments Comment[]
+  efforts  SegmentEffort[]
+}
+
+model Track {
+  id         String   @id @default(cuid())
+  activityId String   @unique
+  points     String // JSON: [[lng, lat, ele, secs], ...]
+  activity   Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+}
+
+model Split {
+  id           String   @id @default(cuid())
+  activityId   String
+  index        Int
+  distanceM    Float
+  timeS        Int
+  elevationDiff Float  @default(0)
+  avgHr        Int?
+  paceZone     Int     @default(0) // -3..3 relative intensity
+  activity     Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+
+  @@unique([activityId, index])
+}
+
+model Lap {
+  id         String   @id @default(cuid())
+  activityId String
+  index      Int
+  distanceM  Float
+  timeS      Int
+  activity   Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+
+  @@unique([activityId, index])
+}
+
+model Kudos {
+  id         String    @id @default(cuid())
+  activityId String?
+  postId     String?
+  athleteId  String
+  createdAt  DateTime  @default(now())
+  activity   Activity? @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  post       Post?     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+}
+
+model Comment {
+  id         String    @id @default(cuid())
+  activityId String?
+  postId     String?
+  athleteId  String
+  text       String
+  createdAt  DateTime  @default(now())
+  activity   Activity? @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  post       Post?     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+}
+
+model Post {
+  id         String   @id @default(cuid())
+  athleteId  String
+  text       String
+  photo      String?
+  visibility String   @default("everyone")
+  createdAt  DateTime @default(now())
+  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+  kudos      Kudos[]
+  comments   Comment[]
+}
+
+// ─── Segments ───────────────────────────────────────────────────────────────
+
+model Segment {
+  id            String   @id @default(cuid())
+  slug          String   @unique
+  name          String
+  description   String?
+  sport         String   @default("ride") // "ride" | "run"
+  distanceM     Float
+  averageGrade  Float    @default(0)
+  maximumGrade  Float    @default(0)
+  elevationHigh Float    @default(0)
+  elevationLow  Float    @default(0)
+  climbCat      Int      @default(0) // 0 sprint, 1..5 climb category
+  points        String // JSON: [[lng, lat, ele], ...]
+  city          String
+  country       String
+  startLat      Float
+  startLng      Float
+  endLat        Float
+  endLng        Float
+  starredCount  Int      @default(0)
+  creatorId     String?
+  creator       Athlete? @relation("segmentCreator", fields: [creatorId], references: [id])
+  createdAt     DateTime @default(now())
+
+  efforts  SegmentEffort[]
+  stars    SegmentStar[]
+}
+
+model SegmentStar {
+  id         String   @id @default(cuid())
+  segmentId  String
+  athleteId  String
+  createdAt  DateTime @default(now())
+  segment    Segment  @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+
+  @@unique([segmentId, athleteId])
+}
+
+model SegmentEffort {
+  id         String   @id @default(cuid())
+  segmentId  String
+  athleteId  String
+  activityId String
+  timeS      Int
+  avgSpeed   Float
+  avgHr      Int?
+  date       DateTime
+  isPR       Boolean  @default(false)
+  rank       Int? // rank on segment leaderboard at creation (1 = CR/KOM)
+  segment    Segment  @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+  activity   Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+
+  @@index([segmentId, athleteId])
+}
+
+// ─── Clubs & events ─────────────────────────────────────────────────────────
+
+model Club {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  description String?
+  sport       String   @default("cycling") // "cycling" | "running" | "triathlon" | "multi"
+  city        String
+  country     String
+  privacy     String   @default("public")
+  memberCount Int      @default(0)
+  coverColor  String   @default("#fc4c02")
+  accentColor String   @default("#242427")
+  createdAt   DateTime @default(now())
+  admins      Athlete[] @relation("clubAdmin")
+  memberships ClubMembership[]
+  events      ClubEvent[]
+}
+
+model ClubMembership {
+  id        String   @id @default(cuid())
+  clubId    String
+  athleteId String
+  role      String   @default("member") // "owner" | "admin" | "member"
+  joinedAt  DateTime @default(now())
+  club      Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  athlete   Athlete  @relation(fields: [athleteId], references: [id])
+
+  @@unique([clubId, athleteId])
+}
+
+model ClubEvent {
+  id          String   @id @default(cuid())
+  clubId      String
+  title       String
+  description String?
+  startDate   DateTime
+  durationMin Int      @default(90)
+  meetingSpot String?
+  routeId     String?
+  sport       String   @default("ride")
+  goingCount  Int      @default(0)
+  club        Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  attendances EventAttendance[]
+}
+
+model EventAttendance {
+  id        String    @id @default(cuid())
+  eventId   String
+  athleteId String
+  status    String    @default("going") // "going" | "interested"
+  createdAt DateTime  @default(now())
+  event     ClubEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  athlete   Athlete  @relation(fields: [athleteId], references: [id])
+
+  @@unique([eventId, athleteId])
+}
+
+// ─── Challenges ─────────────────────────────────────────────────────────────
+
+model Challenge {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  title       String
+  description String
+  category    String   @default("run") // "run" | "ride" | "walk" | "yoga" | "general"
+  type        String   @default("distance") // "distance" | "time" | "elevation" | "activities"
+  goalValue   Float // km | minutes | m | count
+  period      String   @default("monthly")
+  startDate   DateTime
+  endDate     DateTime
+  badgeIcon   String   @default("award") // lucide icon name
+  accentColor String   @default("#fc4c02")
+  joinedCount Int      @default(0)
+  featured    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  entries ChallengeEntry[]
+}
+
+model ChallengeEntry {
+  id          String    @id @default(cuid())
+  challengeId String
+  athleteId   String
+  joinedAt    DateTime  @default(now())
+  completedAt DateTime?
+  challenge   Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  athlete     Athlete  @relation(fields: [athleteId], references: [id])
+
+  @@unique([challengeId, athleteId])
+}
+
+// ─── Gear, goals, routes, notifications ─────────────────────────────────────
+
+model Gear {
+  id         String   @id @default(cuid())
+  athleteId  String
+  type       String   @default("shoes") // "shoes" | "bike" | "other"
+  name       String
+  brand      String?
+  model      String?
+  distanceM  Float    @default(0)
+  retired    Boolean  @default(false)
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+  activities Activity[]
+}
+
+model Goal {
+  id        String   @id @default(cuid())
+  athleteId String
+  metric    String   @default("distance") // "distance" | "time" | "elevation"
+  target    Float // per period (km | minutes | m)
+  period    String   @default("weekly") // "weekly" | "monthly" | "yearly"
+  sport     String? // null = all sports
+  createdAt DateTime @default(now())
+  athlete   Athlete  @relation(fields: [athleteId], references: [id])
+}
+
+model Route {
+  id            String   @id @default(cuid())
+  athleteId     String
+  name          String
+  description   String?
+  sport         String   @default("ride")
+  points        String // JSON: [[lng, lat, ele], ...]
+  distanceM     Float
+  elevationM    Float    @default(0)
+  estimatedTimeS Int?
+  isPublic      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  athlete       Athlete  @relation(fields: [athleteId], references: [id])
+}
+
+model Notification {
+  id          String   @id @default(cuid())
+  recipientId String
+  actorId     String?
+  type        String // "kudos" | "comment" | "comment_reply" | "follow" | "club_join" | "event" | "challenge_milestone" | "segment_record" | "welcome"
+  activityId  String?
+  postId      String?
+  clubId      String?
+  challengeId String?
+  text        String?
+  read        Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  recipient   Athlete  @relation("recipient", fields: [recipientId], references: [id])
+  actor       Athlete? @relation("actor", fields: [actorId], references: [id])
+}

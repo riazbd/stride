@@ -1,0 +1,230 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-inter), -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-elevation: var(--elevation);
+  --color-trophy: var(--trophy);
+  --color-kudos: var(--kudos);
+  --color-achievement: var(--achievement);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.5rem;
+  /* Strava-inspired neutrals + single orange accent */
+  --background: #ffffff;
+  --foreground: #242427;
+  --card: #ffffff;
+  --card-foreground: #242427;
+  --popover: #ffffff;
+  --popover-foreground: #242427;
+  --primary: #fc4c02;
+  --primary-foreground: #ffffff;
+  --secondary: #f2f2f3;
+  --secondary-foreground: #242427;
+  --muted: #f5f5f6;
+  --muted-foreground: #85858c;
+  --accent: #f5f5f6;
+  --accent-foreground: #242427;
+  --destructive: #d5302a;
+  --border: #e8e8ea;
+  --input: #e2e2e4;
+  --ring: #fc4c02;
+  --chart-1: #fc4c02;
+  --chart-2: #b8b8be;
+  --chart-3: #242427;
+  --chart-4: #e0a355;
+  --chart-5: #6fb59c;
+  --elevation: #f7f7f8;
+  --trophy: #f2b544;
+  --kudos: #fc4c02;
+  --achievement: #00a86b;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #242427;
+  --sidebar-primary: #fc4c02;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f5f5f6;
+  --sidebar-accent-foreground: #242427;
+  --sidebar-border: #e8e8ea;
+  --sidebar-ring: #fc4c02;
+}
+
+.dark {
+  --background: #101013;
+  --foreground: #ececef;
+  --card: #191a1e;
+  --card-foreground: #ececef;
+  --popover: #191a1e;
+  --popover-foreground: #ececef;
+  --primary: #ff5a1f;
+  --primary-foreground: #ffffff;
+  --secondary: #232429;
+  --secondary-foreground: #ececef;
+  --muted: #1e1f24;
+  --muted-foreground: #96969e;
+  --accent: #1e1f24;
+  --accent-foreground: #ececef;
+  --destructive: #e5484d;
+  --border: #2a2b31;
+  --input: #2e2f36;
+  --ring: #ff5a1f;
+  --chart-1: #ff5a1f;
+  --chart-2: #4a4b52;
+  --chart-3: #d6d6da;
+  --chart-4: #d9a558;
+  --chart-5: #5f9c88;
+  --elevation: #16171a;
+  --trophy: #d9a558;
+  --kudos: #ff5a1f;
+  --achievement: #29b573;
+  --sidebar: #191a1e;
+  --sidebar-foreground: #ececef;
+  --sidebar-primary: #ff5a1f;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #1e1f24;
+  --sidebar-accent-foreground: #ececef;
+  --sidebar-border: #2a2b31;
+  --sidebar-ring: #ff5a1f;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  /* ── Native-app scrollbar policy ───────────────────────────────────────
+     Mobile apps NEVER render persistent scrollbars: scrolling works,
+     bars are invisible. Suppressed GLOBALLY (every element + document)
+     so no screen, sheet, popover, or future component can regress it. */
+  * {
+    scrollbar-width: none;      /* Firefox + Chromium 121+ */
+    -ms-overflow-style: none;   /* legacy Edge */
+  }
+  *::-webkit-scrollbar {
+    display: none;              /* Chrome / Safari / Edge */
+    width: 0;
+    height: 0;
+  }
+
+  html {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior-y: none;
+  }
+
+  /* App is a fixed, self-contained viewport (fixed inset-0 shell that
+     manages its own scrolling) — the document itself must never scroll
+     or show browser-level scrollbar gutters. */
+  html,
+  body {
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  /* Strava-style dense stat figures */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+}
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .hairline-b {
+    box-shadow: inset 0 -1px 0 var(--border);
+  }
+  .pt-safe {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  /* radar halo pulsing behind the record button while a recording runs */
+  .animate-record-halo {
+    animation: record-halo 1.8s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+  }
+}
+
+@keyframes record-halo {
+  0% {
+    transform: scale(1);
+    opacity: 0.5;
+  }
+  70%,
+  100% {
+    transform: scale(1.4);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-record-halo {
+    animation: none;
+  }
+}
+
+/* maplibre attribution compact + theme fit */
+.maplibregl-ctrl-attrib {
+  font-size: 9px !important;
+  background: transparent !important;
+}
+.maplibregl-ctrl-attrib a {
+  color: var(--muted-foreground) !important;
+}
+.maplibregl-ctrl-bottom-right {
+  z-index: 2 !important;
+}
+.maplibregl-canvas:focus {
+  outline: none;
+}
+
+/* slide-to-save control */
+.slide-track {
+  touch-action: none;
+}

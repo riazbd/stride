@@ -1,0 +1,325 @@
+import { db } from "@/lib/db";
+import { haversineM } from "@/lib/geo";
+
+// ─── Best rolling efforts from a GPS track ───────────────────────────────────
+
+export function bestEffort(
+  pts: { lng: number; lat: number; t: number }[],
+  targetM: number
+): number | null {
+  if (pts.length < 5) return null;
+  // cumulative distance & moving time arrays
+  const cum: number[] = [0];
+  const cumT: number[] = [0];
+  for (let i = 1; i < pts.length; i++) {
+    const d = haversineM([pts[i - 1].lng, pts[i - 1].lat], [pts[i].lng, pts[i].lat]);
+    const dt = pts[i].t - pts[i - 1].t;
+    const v = dt > 0 ? d / dt : 99;
+    const moving = v > 0.55 && v < 25;
+    cum.push(cum[i - 1] + (moving ? d : 0));
+    cumT.push(cumT[i - 1] + (moving ? dt : 0));
+  }
+  let best: number | null = null;
+  let j = 0;
+  for (let i = 0; i < pts.length; i++) {
+    if (cum[i] < targetM) continue;
+    while (j < i && cum[i] - cum[j] > targetM) j++;
+    if (cum[i] - cum[j] >= targetM * 0.999) {
+      const time = cumT[i] - cumT[j];
+      if (time > 0 && (best === null || time < best)) best = time;
+    }
+  }
+  return best;
+}
+
+export const BEST_DISTANCES = [
+  { d: 1000, label: "1K" },
+  { d: 5000, label: "5K" },
+  { d: 10000, label: "10K" },
+  { d: 21097.5, label: "Half Marathon" },
+  { d: 42195, label: "Marathon" },
+  { d: 40000, label: "40K TT" },
+];
+
+// ─── Personal records across an athlete's history ────────────────────────────
+
+export interface PRRecord {
+  distance: number;
+  label: string;
+  timeS: number;
+  activityId: string;
+  startDate: string;
+  activityTitle: string | null;
+}
+
+export async function personalRecords(athleteId: string): Promise<PRRecord[]> {
+  const acts = await db.activity.findMany({
+    where: { athleteId, isTrainer: false, distanceM: { gte: 1000 } },
+    select: {
+      id: true, title: true, startDate: true, sport: true,
+      track: { select: { points: true } },
+    },
+    orderBy: { startDate: "asc" },
+  });
+  const prs: PRRecord[] = [];
+  const isRunSport = (s: string) => ["run", "trail_run"].includes(s);
+  for (const dist of BEST_DISTANCES) {
+    let best: PRRecord | null = null;
+    for (const a of acts) {
+      if (dist.d >= 21097 ? !isRunSport(a.sport) : !isRunSport(a.sport)) {
+        // distance PRs computed for running; 40K TT for rides
+        if (dist.label === "40K TT" && a.sport !== "ride") continue;
+        if (dist.label !== "40K TT" && a.sport !== "run") continue;
+      }
+      if (!a.track) continue;
+      let pts: { lng: number; lat: number; t: number }[];
+      try {
+        pts = JSON.parse(a.track.points).map((p: number[]) => ({ lng: p[0], lat: p[1], t: p[3] }));
+      } catch {
+        continue;
+      }
+      const best1 = bestEffort(pts, dist.d);
+      if (best1 && (!best || best1 < best.timeS)) {
+        best = { distance: dist.d, label: dist.label, timeS: best1, activityId: a.id, startDate: a.startDate.toISOString(), activityTitle: a.title };
+      }
+    }
+    if (best) prs.push(best);
+  }
+  return prs;
+}
+
+// ─── Weekly / YTD / all-time stats ───────────────────────────────────────────
+
+export interface PeriodStats {
+  distanceM: number;
+  movingTimeS: number;
+  elevationM: number;
+  activities: number;
+  relativeEffort: number;
+}
+
+export function emptyStats(): PeriodStats {
+  return { distanceM: 0, movingTimeS: 0, elevationM: 0, activities: 0, relativeEffort: 0 };
+}
+
+export function aggStats(rows: { distanceM: number; movingTimeS: number; elevationM: number; relativeEffort: number | null }[]): PeriodStats {
+  const s = emptyStats();
+  for (const r of rows) {
+    s.distanceM += r.distanceM;
+    s.movingTimeS += r.movingTimeS;
+    s.elevationM += r.elevationM;
+    s.activities += 1;
+    s.relativeEffort += r.relativeEffort ?? 0;
+  }
+  return s;
+}
+
+export function startOfWeek(d = new Date()): Date {
+  const date = new Date(d);
+  const day = date.getDay() || 7;
+  date.setDate(date.getDate() - (day - 1));
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+export async function athleteStats(athleteId: string) {
+  const [week, ytd, all, last4] = await Promise.all([
+    db.activity.findMany({
+      where: { athleteId, startDate: { gte: startOfWeek() } },
+      select: { distanceM: true, movingTimeS: true, elevationM: true, relativeEffort: true },
+    }),
+    db.activity.findMany({
+      where: { athleteId, startDate: { gte: new Date(new Date().getFullYear(), 0, 1) } },
+      select: { distanceM: true, movingTimeS: true, elevationM: true, relativeEffort: true },
+    }),
+    db.activity.findMany({
+      where: { athleteId },
+      select: { distanceM: true, movingTimeS: true, elevationM: true, relativeEffort: true },
+    }),
+    weeklyHistory(athleteId, 12),
+  ]);
+  return {
+    week: aggStats(week),
+    ytd: aggStats(ytd),
+    all: aggStats(all),
+    weekly: last4,
+  };
+}
+
+export interface WeeklyBucket {
+  weekStart: string;
+  distanceM: number;
+  movingTimeS: number;
+  elevationM: number;
+  activities: number;
+}
+
+export async function weeklyHistory(athleteId: string, weeks: number): Promise<WeeklyBucket[]> {
+  const now = new Date();
+  const from = startOfWeek(now);
+  from.setDate(from.getDate() - (weeks - 1) * 7);
+  const rows = await db.activity.findMany({
+    where: { athleteId, startDate: { gte: from } },
+    select: { startDate: true, distanceM: true, movingTimeS: true, elevationM: true },
+    orderBy: { startDate: "asc" },
+  });
+  const buckets: WeeklyBucket[] = [];
+  for (let i = 0; i < weeks; i++) {
+    const ws = new Date(from.getTime() + i * 7 * 86400000);
+    buckets.push({ weekStart: ws.toISOString(), distanceM: 0, movingTimeS: 0, elevationM: 0, activities: 0 });
+  }
+  const msWeek = 7 * 86400000;
+  for (const r of rows) {
+    let idx = Math.floor((r.startDate.getTime() - from.getTime()) / msWeek);
+    if (idx < 0 || idx >= weeks) continue;
+    buckets[idx].distanceM += r.distanceM;
+    buckets[idx].movingTimeS += r.movingTimeS;
+    buckets[idx].elevationM += r.elevationM;
+    buckets[idx].activities += 1;
+  }
+  return buckets;
+}
+
+// ─── Fitness & Freshness (CTL / ATL / TSB) ───────────────────────────────────
+
+export interface FitnessPoint {
+  date: string;
+  fitness: number; // CTL
+  fatigue: number; // ATL
+  form: number; // TSB
+  load: number; // daily TRIMP-ish (relative effort)
+}
+
+export async function fitnessSeries(athleteId: string, days = 90): Promise<FitnessPoint[]> {
+  const from = new Date(Date.now() - (days + 30) * 86400000);
+  const rows = await db.activity.findMany({
+    where: { athleteId, startDate: { gte: from } },
+    select: { startDate: true, relativeEffort: true, movingTimeS: true, avgHr: true },
+  });
+  // daily load map
+  const daily = new Map<string, number>();
+  for (const r of rows as any[]) {
+    const key = r.startDate.toISOString().slice(0, 10);
+    const load = r.relativeEffort ?? Math.round((r.movingTimeS / 3600) * 55);
+    daily.set(key, (daily.get(key) ?? 0) + load);
+  }
+  let ctl = 0, atl = 0;
+  const out: FitnessPoint[] = [];
+  const start = new Date(from);
+  for (let d = 0; d < days + 30; d++) {
+    const day = new Date(start.getTime() + d * 86400000);
+    const key = day.toISOString().slice(0, 10);
+    const load = daily.get(key) ?? 0;
+    ctl = ctl + (load - ctl) * (1 / 42);
+    atl = atl + (load - atl) * (1 / 7);
+    if (d >= 30) {
+      out.push({
+        date: day.toISOString(),
+        fitness: Math.round(ctl),
+        fatigue: Math.round(atl),
+        form: Math.round(ctl - atl),
+        load,
+      });
+    }
+  }
+  return out;
+}
+
+// ─── Training log (calendar) ─────────────────────────────────────────────────
+
+export interface TrainingDay {
+  date: string;
+  distanceM: number;
+  movingTimeS: number;
+  activities: { id: string; sport: string; title: string | null; distanceM: number; movingTimeS: number }[];
+}
+
+export async function trainingLog(athleteId: string, year: number, month: number): Promise<TrainingDay[]> {
+  const start = new Date(Date.UTC(year, month, 1));
+  const end = new Date(Date.UTC(year, month + 1, 1));
+  const rows = await db.activity.findMany({
+    where: { athleteId, startDate: { gte: start, lt: end } },
+    select: { id: true, sport: true, title: true, distanceM: true, movingTimeS: true, startDate: true },
+    orderBy: { startDate: "asc" },
+  });
+  const byDay = new Map<string, TrainingDay>();
+  const days = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  for (let d = 1; d <= days; d++) {
+    const key = new Date(Date.UTC(year, month, d)).toISOString().slice(0, 10);
+    byDay.set(key, { date: key, distanceM: 0, movingTimeS: 0, activities: [] });
+  }
+  for (const r of rows) {
+    const key = r.startDate.toISOString().slice(0, 10);
+    const day = byDay.get(key);
+    if (!day) continue;
+    day.distanceM += r.distanceM;
+    day.movingTimeS += r.movingTimeS;
+    day.activities.push({ id: r.id, sport: r.sport, title: r.title, distanceM: r.distanceM, movingTimeS: r.movingTimeS });
+  }
+  return [...byDay.values()];
+}
+
+// ─── Challenge progress (live-computed) ──────────────────────────────────────
+
+export async function challengeProgress(athleteId: string, challenge: any): Promise<number> {
+  const rows = await db.activity.findMany({
+    where: {
+      athleteId,
+      startDate: { gte: challenge.startDate, lte: challenge.endDate },
+      ...challengeSportFilter(challenge),
+    },
+    select: { distanceM: true, movingTimeS: true, elevationM: true },
+  });
+  switch (challenge.type) {
+    case "distance":
+      return rows.reduce((a, r) => a + r.distanceM, 0) / 1000;
+    case "single_distance":
+      return Math.max(0, ...rows.map((r) => r.distanceM), 0) / 1000;
+    case "time":
+      return rows.reduce((a, r) => a + r.movingTimeS, 0) / 60;
+    case "elevation":
+      return rows.reduce((a, r) => a + r.elevationM, 0);
+    case "activities":
+      return rows.length;
+    default:
+      return 0;
+  }
+}
+
+function challengeSportFilter(c: any) {
+  const map: Record<string, string[]> = {
+    run: ["run", "trail_run"],
+    ride: ["ride", "gravel", "mtb", "ebike", "virtual_ride"],
+    walk: ["walk", "hike"],
+    yoga: ["yoga"],
+    general: undefined,
+  };
+  const sports = map[c.category];
+  if (!sports) return {};
+  return { sport: { in: sports } };
+}
+
+// ─── Streak (consecutive active weeks) ───────────────────────────────────────
+
+export async function currentStreak(athleteId: string): Promise<number> {
+  const from = new Date(Date.now() - 400 * 86400000);
+  const rows = await db.activity.findMany({
+    where: { athleteId, startDate: { gte: from } },
+    select: { startDate: true },
+  });
+  const weeks = new Set(rows.map((r) => weekStartKey(r.startDate)));
+  let streak = 0;
+  let cursor = startOfWeek();
+  // if current week has nothing yet, start from last week
+  if (!weeks.has(weekStartKey(cursor))) cursor = new Date(cursor.getTime() - 7 * 86400000);
+  while (weeks.has(weekStartKey(cursor))) {
+    streak++;
+    cursor = new Date(cursor.getTime() - 7 * 86400000);
+  }
+  return streak;
+}
+
+function weekStartKey(d: Date): string {
+  const ws = startOfWeek(d);
+  return ws.toISOString().slice(0, 10);
+}
