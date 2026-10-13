@@ -41,7 +41,7 @@ export function SearchScreen() {
 
   const follow = async (id: string) => {
     try {
-      await api.post(`athletes/${id}/follow`);
+      await api.post(`athletes/${id}/follow`, { on: true });
       qc.invalidateQueries({ queryKey: ["search"] });
     } catch (e: any) {
       toast({ description: e.message ?? "Failed" });

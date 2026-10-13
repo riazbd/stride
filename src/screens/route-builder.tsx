@@ -15,6 +15,24 @@ import { PremiumGate, usePremium } from "@/components/app/premium";
 
 const SPORT_SPEED: Record<string, number> = { run: 3.2, walk: 1.4, ride: 6.5, gravel: 5.8 };
 
+// OSRM servers with pedestrian and bicycle profiles (FOSSGIS, same as openstreetmap.org's
+// directions) — car routing would avoid footpaths and obey one-way streets. Self-host
+// osrm-backend and point these at it for production traffic.
+const ROUTERS = {
+  foot: process.env.NEXT_PUBLIC_OSRM_FOOT_URL ?? "https://routing.openstreetmap.de/routed-foot",
+  bike: process.env.NEXT_PUBLIC_OSRM_BIKE_URL ?? "https://routing.openstreetmap.de/routed-bike",
+};
+const routerFor = (sport: string) => (["run", "walk", "hike", "trail_run"].includes(sport) ? ROUTERS.foot : ROUTERS.bike);
+
+async function routeVia(wp: [number, number][], sport: string): Promise<{ coords: [number, number][]; distance: number } | null> {
+  const coordStr = wp.map((w) => `${w[0].toFixed(6)},${w[1].toFixed(6)}`).join(";");
+  // the path segment is the OSRM API's profile slot; these servers serve one profile each
+  const res = await fetch(`${routerFor(sport)}/route/v1/driving/${coordStr}?overview=full&geometries=geojson`);
+  const json = await res.json();
+  if (json.code !== "Ok") return null;
+  return { coords: json.routes[0].geometry.coordinates, distance: json.routes[0].distance };
+}
+
 export function RouteBuilderScreen() {
   const nav = useNav();
   const units = useUnits();
@@ -34,17 +52,14 @@ export function RouteBuilderScreen() {
     const wp = [...waypoints, [lng, lat] as [number, number]];
     setWaypoints(wp);
     if (wp.length < 2) return;
-    // snap via OSRM (public routing service)
     const reqId = ++lastRequest.current;
     setRouting(true);
     try {
-      const coordStr = wp.map((w) => `${w[0].toFixed(6)},${w[1].toFixed(6)}`).join(";");
-      const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordStr}?overview=full&geometries=geojson`);
-      const json = await res.json();
+      const route = await routeVia(wp, sport);
       if (reqId !== lastRequest.current) return;
-      if (json.code === "Ok") {
-        setSnapped(json.routes[0].geometry.coordinates);
-        setDistance(json.routes[0].distance);
+      if (route) {
+        setSnapped(route.coords);
+        setDistance(route.distance);
       } else {
         toast({ description: "Could not route between those points" });
         setWaypoints(waypoints);
@@ -54,7 +69,7 @@ export function RouteBuilderScreen() {
     } finally {
       if (reqId === lastRequest.current) setRouting(false);
     }
-  }, [waypoints]);
+  }, [waypoints, sport, toast]);
 
   const undo = () => {
     const wp = waypoints.slice(0, -1);
@@ -64,24 +79,29 @@ export function RouteBuilderScreen() {
       setDistance(0);
       return;
     }
-    onMapClick2(wp);
+    reroute(wp, sport);
   };
 
-  const onMapClick2 = async (wp: [number, number][]) => {
+  const reroute = async (wp: [number, number][], forSport: string) => {
+    if (wp.length < 2) return;
     const reqId = ++lastRequest.current;
     setRouting(true);
     try {
-      const coordStr = wp.map((w) => `${w[0].toFixed(6)},${w[1].toFixed(6)}`).join(";");
-      const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordStr}?overview=full&geometries=geojson`);
-      const json = await res.json();
+      const route = await routeVia(wp, forSport);
       if (reqId !== lastRequest.current) return;
-      if (json.code === "Ok") {
-        setSnapped(json.routes[0].geometry.coordinates);
-        setDistance(json.routes[0].distance);
+      if (route) {
+        setSnapped(route.coords);
+        setDistance(route.distance);
       }
     } catch { /* keep old */ } finally {
       if (reqId === lastRequest.current) setRouting(false);
     }
+  };
+
+  // switching between foot and bike changes which paths are allowed
+  const changeSport = (s: string) => {
+    setSport(s);
+    if (routerFor(s) !== routerFor(sport)) reroute(waypoints, s);
   };
 
   const save = async () => {
@@ -159,7 +179,7 @@ export function RouteBuilderScreen() {
           {["ride", "run", "walk", "gravel"].map((s) => (
             <button
               key={s}
-              onClick={() => setSport(s)}
+              onClick={() => changeSport(s)}
               className={cn(
                 "flex items-center gap-1.5 px-3 h-9 rounded-lg border text-[12.5px] font-semibold shrink-0 transition-colors",
                 sport === s ? "border-primary bg-primary/5 text-primary" : "border-border text-muted-foreground"

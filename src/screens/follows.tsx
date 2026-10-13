@@ -23,7 +23,7 @@ export function FollowsScreen({ id, which }: { id: string; which: "following" | 
 
   const follow = async (personId: string, currently: boolean) => {
     try {
-      await api.post(`athletes/${personId}/follow`);
+      await api.post(`athletes/${personId}/follow`, { on: !currently });
       qc.invalidateQueries({ queryKey: ["follows", id] });
       if (!currently) toast({ description: "Following" });
     } catch (e: any) {

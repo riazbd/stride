@@ -66,7 +66,7 @@ export function StatsScreen({ id }: { id: string }) {
         <div className="bg-card border border-border rounded-lg px-4 py-4">
           <div className="flex items-center gap-2 mb-3">
             <Zap size={16} className="text-primary" />
-            <h3 className="text-[13px] font-bold uppercase tracking-wider text-muted-foreground">Relative effort · last 12 weeks</h3>
+            <h3 className="text-[13px] font-bold uppercase tracking-wider text-muted-foreground">Distance · last 12 weeks</h3>
           </div>
           <div className="flex items-end gap-1 h-20">
             {stats.weekly.map((w, i) => {

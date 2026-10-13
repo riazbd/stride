@@ -1,13 +1,13 @@
 "use client";
 import React, { useState } from "react";
 import { motion } from "framer-motion";
-import { ChevronDown, Pause, Play, Trash2, Flag, Satellite, ChevronUp, HeartPulse } from "lucide-react";
+import { ChevronDown, Pause, Play, Trash2, Flag, Satellite, ChevronUp, HeartPulse, Zap } from "lucide-react";
 import { useNav, useUI } from "@/lib/nav";
 import { useRecorder } from "@/lib/recorder";
 import { useSensors, ZONE_COLORS, ZONE_NAMES, hrZoneIndex } from "@/lib/sensors";
 import { MapView } from "@/components/app/MapView";
 import { sportOf } from "@/lib/sports";
-import { fmtDist, fmtDuration, fmtPace, MI } from "@/lib/format";
+import { fmtDist, fmtDuration, fmtPace, speedOf, MI } from "@/lib/format";
 import { useUnits } from "@/components/app/cards";
 import { cn } from "@/lib/utils";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
@@ -17,6 +17,7 @@ export function RecordingScreen() {
   const nav = useNav();
   const units = useUnits();
   const hrm = useSensors((s) => s.hrm);
+  const pm = useSensors((s) => s.pm);
   const maxHr = useUI((s) => s.me?.maxHr) ?? 190;
   const hrZone = hrm.hr && hrm.status === "connected" ? hrZoneIndex(hrm.hr, maxHr) : null;
   const [mapExpanded, setMapExpanded] = useState(false);
@@ -33,7 +34,7 @@ export function RecordingScreen() {
   const moving = rec.movingMs / 1000;
   const currentPace = rec.currentSpeed > 0.6 ? unitM / rec.currentSpeed : 0;
   const avgPace = dist > 20 && moving > 5 ? moving / (dist / unitM) : 0;
-  const currentSpeedKmh = rec.currentSpeed * 3.6;
+  const currentSpeed = speedOf(rec.currentSpeed, 1, units);
   const lastSplit = rec.splits[rec.splits.length - 1];
   // flash the latest split for 3.5s after it happens (ticker re-renders 4x/s)
   const flash = rec.lastSplitAt && Date.now() - rec.lastSplitAt < 3500 ? rec.splits.length : null;
@@ -77,6 +78,12 @@ export function RecordingScreen() {
               <span className="tnum text-[11px] font-bold">{hrm.hr ?? "--"} bpm</span>
             </div>
           )}
+          {pm.status === "connected" && (
+            <div className="h-9 flex items-center gap-1.5 px-3 rounded-full bg-background/90 backdrop-blur border border-border shadow-sm">
+              <Zap size={13} className="text-primary" fill="currentColor" />
+              <span className="tnum text-[11px] font-bold">{pm.watts ?? "--"} W</span>
+            </div>
+          )}
           {rec.autoPaused && (
             <div className="h-9 flex items-center px-3 rounded-full bg-trophy/90 text-background text-[11px] font-bold shadow-sm animate-pulse">
               AUTO-PAUSED
@@ -103,9 +110,9 @@ export function RecordingScreen() {
             <div className="text-[12px] text-muted-foreground font-medium mt-1">{def.label}</div>
           </div>
           <div className="text-right">
-            <div className="tnum text-[28px] font-bold leading-none">{fmtDuration(elapsed)}</div>
+            <div className="tnum text-[28px] font-bold leading-none">{fmtDuration(moving)}</div>
             <div className="tnum text-[11px] text-muted-foreground font-medium mt-1">
-              moving {fmtDuration(moving)}
+              elapsed {fmtDuration(elapsed)}
             </div>
           </div>
         </div>
@@ -119,11 +126,15 @@ export function RecordingScreen() {
             </>
           ) : (
             <>
-              <Metric label="Current speed" value={currentSpeedKmh ? currentSpeedKmh.toFixed(1) : "—"} sub={units === "km" ? "km/h" : "mph"} />
-              <Metric label="Avg speed" value={dist > 20 && moving > 5 ? ((dist / moving) * 3.6).toFixed(1) : "—"} sub={units === "km" ? "km/h" : "mph"} />
+              <Metric label="Current speed" value={currentSpeed ? currentSpeed.toFixed(1) : "—"} sub={units === "km" ? "km/h" : "mph"} />
+              <Metric label="Avg speed" value={dist > 20 && moving > 5 ? speedOf(dist, moving, units).toFixed(1) : "—"} sub={units === "km" ? "km/h" : "mph"} />
             </>
           )}
-          <Metric label="Elevation" value={String(Math.round(rec.elevationM))} sub="m gain" />
+          {pm.status === "connected" ? (
+            <Metric label="Power" value={pm.watts != null ? String(pm.watts) : "--"} sub="W" />
+          ) : (
+            <Metric label="Elevation" value={String(Math.round(units === "km" ? rec.elevationM : rec.elevationM * 3.28084))} sub={units === "km" ? "m gain" : "ft gain"} />
+          )}
           {hrm.status === "connected" ? (
             <div>
               <div className="tnum text-[22px] font-bold leading-none flex items-baseline gap-1" style={{ color: hrZone != null ? ZONE_COLORS[hrZone] : undefined }}>
@@ -176,7 +187,7 @@ export function RecordingScreen() {
           ) : rec.autoPaused ? (
             <div className="flex items-center justify-center">
               <button
-                onClick={() => { rec.setAutoPause(false); rec.resume(); setTimeout(() => useRecorder.getState().setAutoPause(true), 1000); }}
+                onClick={rec.resume}
                 className="w-20 h-20 rounded-full bg-primary text-primary-foreground flex items-center justify-center active:scale-95 transition-transform"
                 aria-label="Resume"
               >
@@ -205,7 +216,7 @@ export function RecordingScreen() {
                     <AlertDialogHeader>
                       <AlertDialogTitle>Discard activity?</AlertDialogTitle>
                       <AlertDialogDescription>
-                        This will permanently delete the {(rec.distanceM / 1000).toFixed(2)} km you just recorded. This can&apos;t be undone.
+                        This will permanently delete the {fmtDist(rec.distanceM, units, 2)} {units === "km" ? "km" : "mi"} you just recorded. This can&apos;t be undone.
                       </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>

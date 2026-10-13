@@ -65,12 +65,10 @@ export function SettingsScreen() {
             </span>
             <span className="flex-1 min-w-0">
               <span className="text-[14.5px] font-bold flex items-center gap-1.5">
-                {me?.premium ? "STRIDE Premium" : "Upgrade to Premium"}
+                Free beta
               </span>
               <span className="block text-[12px] text-muted-foreground mt-0.5 truncate">
-                {me?.premium
-                  ? me.premiumPlan === "yearly" ? "Yearly plan · active" : "Monthly plan · active"
-                  : "Leaderboards, zones, GAP, routes, goals & more"}
+                Every feature is unlocked while STRIDE is in beta
               </span>
             </span>
             <ChevronRight size={16} className="text-muted-foreground shrink-0" />
@@ -205,7 +203,7 @@ function ChangePasswordSheet({ onClose }: { onClose: () => void }) {
   const [saving, setSaving] = useState(false);
 
   const save = async () => {
-    if (next.length < 6) return toast({ description: "New password must be at least 6 characters" });
+    if (next.length < 8) return toast({ description: "New password must be at least 8 characters" });
     if (next !== confirm) return toast({ description: "Passwords don't match" });
     setSaving(true);
     try {

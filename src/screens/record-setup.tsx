@@ -7,7 +7,8 @@ import { useSensors } from "@/lib/sensors";
 import { ScreenHeader } from "@/components/app/shell";
 import { SportIcon, SegmentedTabs } from "@/components/app/ui";
 import { RECORD_SPORTS, sportOf } from "@/lib/sports";
-import { fmtDuration } from "@/lib/format";
+import { fmtDist, fmtDuration } from "@/lib/format";
+import { useUnits } from "@/components/app/cards";
 import { cn } from "@/lib/utils";
 
 const CATEGORIES: { id: string; label: string; sports: string[] }[] = [
@@ -21,12 +22,14 @@ const CATEGORIES: { id: string; label: string; sports: string[] }[] = [
 export function RecordSetupScreen() {
   const nav = useNav();
   const rec = useRecorder();
+  const units = useUnits();
   const [cat, setCat] = useState("run");
   const [sport, setSport] = useState("run");
   const [autoPause, setAutoPause] = useState(true);
   const hrm = useSensors((s) => s.hrm);
   const csc = useSensors((s) => s.csc);
-  const sensorsOn = hrm.status === "connected" || csc.status === "connected";
+  const pm = useSensors((s) => s.pm);
+  const sensorsOn = hrm.status === "connected" || csc.status === "connected" || pm.status === "connected";
   const active = rec.state !== "idle";
 
   const gpsColor =
@@ -62,7 +65,7 @@ export function RecordSetupScreen() {
           <span className="w-2.5 h-2.5 rounded-full bg-primary animate-pulse" />
           <div className="flex-1 text-left">
             <div className="text-[13px] font-bold text-primary">{rec.state === "paused" ? "Paused" : "Recording"} — {sportOf(rec.sport).label}</div>
-            <div className="tnum text-[12px] text-muted-foreground">{(rec.distanceM / 1000).toFixed(2)} km · {fmtDuration(rec.elapsedMs / 1000)}</div>
+            <div className="tnum text-[12px] text-muted-foreground">{fmtDist(rec.distanceM, units, 2)} {units === "km" ? "km" : "mi"} · {fmtDuration(rec.movingMs / 1000)}</div>
           </div>
           <span className="text-[12.5px] font-bold text-primary">Resume</span>
         </button>
@@ -133,9 +136,11 @@ export function RecordSetupScreen() {
               <div className="text-[11.5px] text-muted-foreground truncate">
                 {hrm.status === "connected"
                   ? `${hrm.name ?? "Heart-rate strap"} · ${hrm.hr ?? "--"} bpm`
-                  : csc.status === "connected"
-                    ? `${csc.name ?? "Speed & cadence"} · live`
-                    : "Connect HR strap & cycling sensors"}
+                  : pm.status === "connected"
+                    ? `${pm.name ?? "Power meter"} · ${pm.watts ?? "--"} W`
+                    : csc.status === "connected"
+                      ? `${csc.name ?? "Speed & cadence"} · live`
+                      : "Connect HR strap, power meter & cycling sensors"}
               </div>
             </div>
             {sensorsOn ? <span className="w-2 h-2 rounded-full bg-achievement shrink-0" /> : <ChevronRight size={15} className="text-muted-foreground shrink-0" />}

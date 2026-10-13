@@ -3,12 +3,13 @@ import React, { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2, Check } from "lucide-react";
 import { api } from "@/lib/api";
-import { useNav } from "@/lib/nav";
+import { useNav, useUI } from "@/lib/nav";
 import { ScreenHeader } from "@/components/app/shell";
 import { SportIcon } from "@/components/app/ui";
 import { useUnits } from "@/components/app/cards";
 import { sportOf, RECORD_SPORTS } from "@/lib/sports";
 import { Input } from "@/components/ui/input";
+import { distToMeters, elevToMeters, elevUnit } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 
@@ -26,7 +27,9 @@ export function ManualActivityScreen() {
   const [title, setTitle] = useState("");
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
   const [time, setTime] = useState(new Date().toTimeString().slice(0, 5));
-  const [visibility, setVisibility] = useState("everyone");
+  // start from the athlete's chosen default, never silently public
+  const defaultVisibility = useUI((s) => s.me?.defaultVisibility) ?? "everyone";
+  const [visibility, setVisibility] = useState(defaultVisibility);
   const [perceived, setPerceived] = useState<number | null>(null);
 
   const mut = useMutation({
@@ -36,10 +39,10 @@ export function ManualActivityScreen() {
         title: title.trim() || `${sportOf(sport).label}`,
         startDate: new Date(`${date}T${time}:00`).toISOString(),
         manual: true,
-        distanceM: (parseFloat(distance) || 0) * 1000,
+        distanceM: distToMeters(parseFloat(distance) || 0, units),
         movingTimeS: (parseInt(hours) || 0) * 3600 + (parseInt(minutes) || 0) * 60 + (parseInt(seconds) || 0),
         elapsedTimeS: (parseInt(hours) || 0) * 3600 + (parseInt(minutes) || 0) * 60 + (parseInt(seconds) || 0),
-        elevationM: parseFloat(elevation) || 0,
+        elevationM: elevToMeters(parseFloat(elevation) || 0, units),
         visibility,
         perceivedEffort: perceived,
         tzOffsetMin: -new Date().getTimezoneOffset(),
@@ -137,7 +140,7 @@ export function ManualActivityScreen() {
               value={elevation} onChange={(e) => setElevation(e.target.value)}
               placeholder="0" className="h-12 text-[20px] font-bold border-0 bg-muted/60 focus-visible:ring-2 focus-visible:ring-primary tnum"
             />
-            <span className="text-[14px] font-bold text-muted-foreground">m</span>
+            <span className="text-[14px] font-bold text-muted-foreground">{elevUnit(units)}</span>
           </div>
         </div>
 

@@ -1,15 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { newToken } from "./password";
+import { newToken, sha256 } from "./password";
 
 const COOKIE = "stride_session";
 const SESSION_DAYS = 30;
 
+// The cookie carries a random token; the database keeps only its sha256, so a
+// leaked database can't be replayed as live sessions.
 export async function createSession(athleteId: string): Promise<string> {
   const token = newToken();
   await db.session.create({
     data: {
-      token,
+      tokenHash: sha256(token),
       athleteId,
       expiresAt: new Date(Date.now() + SESSION_DAYS * 86400000),
     },
@@ -18,12 +20,11 @@ export async function createSession(athleteId: string): Promise<string> {
 }
 
 export function setSessionCookie(res: NextResponse, token: string, https = false) {
-  // In third-party/embedded HTTPS contexts (e.g. hosted previews), browsers only
-  // accept cookies with SameSite=None + Secure. Plain Lax is enough for
-  // first-party localhost/http development.
+  // Lax keeps the cookie off cross-site POSTs (CSRF) while still sending it on
+  // normal top-level navigation to the app.
   res.cookies.set(COOKIE, token, {
     httpOnly: true,
-    sameSite: https ? "none" : "lax",
+    sameSite: "lax",
     secure: https,
     maxAge: SESSION_DAYS * 86400,
     path: "/",
@@ -32,25 +33,28 @@ export function setSessionCookie(res: NextResponse, token: string, https = false
 }
 
 export function clearSessionCookie(res: NextResponse) {
-  res.cookies.set(COOKIE, "", { httpOnly: true, maxAge: 0, path: "/" });
+  res.cookies.set(COOKIE, "", { httpOnly: true, sameSite: "lax", maxAge: 0, path: "/" });
   return res;
 }
 
+export function sessionTokenOf(req: NextRequest): string | null {
+  return req.cookies.get(COOKIE)?.value || null;
+}
+
 export async function athleteIdOf(req: NextRequest): Promise<string | null> {
-  const token = req.cookies.get(COOKIE)?.value;
+  const token = sessionTokenOf(req);
   if (!token) return null;
   const session = await db.session.findUnique({
-    where: { token },
+    where: { tokenHash: sha256(token) },
     select: { athleteId: true, expiresAt: true },
   });
   if (!session || session.expiresAt.getTime() < Date.now()) return null;
   return session.athleteId;
 }
 
-export async function athleteOf(req: NextRequest) {
-  const id = await athleteIdOf(req);
-  if (!id) return null;
-  return db.athlete.findUnique({ where: { id } });
+// ends only the session this cookie belongs to; other devices stay signed in
+export async function endSession(token: string | null): Promise<void> {
+  if (token) await db.session.deleteMany({ where: { tokenHash: sha256(token) } });
 }
 
 export function json(data: unknown, init?: number | ResponseInit) {

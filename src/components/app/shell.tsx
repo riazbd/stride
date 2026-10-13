@@ -8,7 +8,8 @@ import { Screen, TabId, screenKey, useNav, useUI, bindHistoryBack } from "@/lib/
 import { api, MeResponse } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Avatar } from "./ui";
-import { useRecorder } from "@/lib/recorder";
+import { useRecorder, recoverRecording } from "@/lib/recorder";
+import { toast } from "@/hooks/use-toast";
 import { ScreenErrorBoundary } from "./ErrorBoundary";
 import { SplashScreen } from "./brand";
 
@@ -293,6 +294,16 @@ export function AppShell() {
       (window as any).__strideSw = true;
       navigator.serviceWorker.register("/sw.js").catch(() => { /* offline support unavailable */ });
     }
+    // an activity left behind by a closed or crashed tab comes back first
+    recoverRecording().then((where) => {
+      if (!where) return;
+      useNav.getState().push({ k: where }, "record");
+      toast({
+        description: where === "recording"
+          ? "We recovered your unfinished activity. It is paused — resume or finish it."
+          : "Your last activity hasn't been uploaded yet. Save it now.",
+      });
+    });
   }, []);
 
   return (

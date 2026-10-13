@@ -9,7 +9,7 @@ import { Avatar, EmptyState } from "@/components/app/ui";
 import { ActivityRow, useUnits } from "@/components/app/cards";
 import { GoalRing, WeeklyBars } from "@/components/app/charts";
 import { PremiumGate, usePremium } from "@/components/app/premium";
-import { fmtDist, distUnit, fmtDuration, fmtElev, relativeDay } from "@/lib/format";
+import { fmtDist, distUnit, fmtDuration, fmtElev, relativeDay, type Units } from "@/lib/format";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 
@@ -39,7 +39,7 @@ export function ProfileScreen({ id }: { id: string }) {
   const followMut = async () => {
     if (!data) return;
     try {
-      await api.post(`athletes/${data.athlete.id}/follow`);
+      await api.post(`athletes/${data.athlete.id}/follow`, { on: !data.athlete.isFollowing });
       qc.invalidateQueries({ queryKey: ["profile", targetId] });
     } catch (e: any) {
       toast({ description: e.message ?? "Failed" });
@@ -192,7 +192,7 @@ export function ProfileScreen({ id }: { id: string }) {
                   </GoalRing>
                   <div>
                     <div className="text-[13px] font-bold flex items-center gap-1.5"><Footprints size={13} /> Run</div>
-                    <div className="tnum text-[12px] text-muted-foreground">{fmtDist(runGoal.current * (units === "km" ? 1000 : 1609.34), units, 1)} / {fmtDist(runGoal.target * (units === "km" ? 1000 : 1609.34), units, 0)} {distUnit(units)}</div>
+                    <div className="tnum text-[12px] text-muted-foreground">{fmtDist(runGoal.current, units, 1)} / {fmtDist(runGoal.target, units, 0)} {distUnit(units)}</div>
                   </div>
                 </div>
               )}
@@ -203,7 +203,7 @@ export function ProfileScreen({ id }: { id: string }) {
                   </GoalRing>
                   <div>
                     <div className="text-[13px] font-bold">Ride</div>
-                    <div className="tnum text-[12px] text-muted-foreground">{fmtDist(rideGoal.current * (units === "km" ? 1000 : 1609.34), units, 1)} / {fmtDist(rideGoal.target * (units === "km" ? 1000 : 1609.34), units, 0)} {distUnit(units)}</div>
+                    <div className="tnum text-[12px] text-muted-foreground">{fmtDist(rideGoal.current, units, 1)} / {fmtDist(rideGoal.target, units, 0)} {distUnit(units)}</div>
                   </div>
                 </div>
               )}
@@ -223,8 +223,8 @@ export function ProfileScreen({ id }: { id: string }) {
                       </div>
                     </div>
                     <div className="tnum text-[11.5px] text-muted-foreground shrink-0 text-right">
-                      <span className="font-bold text-foreground">{g.metric === "time" ? `${Math.round(g.current)}h` : g.metric === "elevation" ? `${Math.round(g.current)}m` : `${g.current.toFixed(1)}${distUnit(units)}`}</span>
-                      {" / "}{g.metric === "time" ? `${g.target}h` : g.metric === "elevation" ? `${g.target}m` : `${g.target}${distUnit(units)}`}
+                      <span className="font-bold text-foreground">{goalValue(g.metric, g.current, units)}</span>
+                      {" / "}{goalValue(g.metric, g.target, units)}
                     </div>
                   </div>
                 ))}
@@ -308,6 +308,13 @@ function StatCol({ label, distance, time, elev, units, border }: { label: string
       <div className="tnum text-[10.5px] text-muted-foreground">{fmtElev(elev, units)} up</div>
     </div>
   );
+}
+
+// goal values arrive in SI: metres, or seconds for time goals
+function goalValue(metric: string, si: number, units: Units): string {
+  if (metric === "time") return fmtDuration(si, "compact");
+  if (metric === "elevation") return fmtElev(si, units);
+  return `${fmtDist(si, units, 1)} ${distUnit(units)}`;
 }
 
 function QuickLink({ icon: Icon, label, count, onClick, premium }: { icon: any; label: string; count?: number; onClick: () => void; premium?: boolean }) {

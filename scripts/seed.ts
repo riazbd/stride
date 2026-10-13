@@ -9,6 +9,9 @@ import {
   LL, TrackPoint, haversineM, encodeTrack, computeSplits, trackStats,
   elevationGain, mulberry32, pathLength, matchSegment,
 } from "../src/lib/geo";
+import { trainingLoad } from "../src/server/effort";
+import { refreshGearDistance, evaluateChallenges } from "../src/server/analytics";
+import { rerankSegments } from "../src/server/handlers/segments";
 
 const NOW = new Date();
 const PW = hashPassword("stridedemo");
@@ -103,7 +106,7 @@ function pointAt(geom: LL[], cums: number[], s: number): LL {
   return [geom[lo][0] + (geom[hi][0] - geom[lo][0]) * t, geom[lo][1] + (geom[hi][1] - geom[lo][1]) * t];
 }
 
-function simulate(o: SimOpts): { points: TrackPoint[]; avgHr: number; maxHr: number; calories: number; relEffort: number } {
+function simulate(o: SimOpts): { points: TrackPoint[]; hrSeries: [number, number][]; avgHr: number | null; maxHr: number; calories: number } {
   const r = mulberry32(o.seed);
   const { cums, total } = cumLengths(o.geom);
   // build working path (repeat loops / out-back to hit target distance)
@@ -138,10 +141,11 @@ function simulate(o: SimOpts): { points: TrackPoint[]; avgHr: number; maxHr: num
   const np = o.sport === "run" ? (r() < 0.5 ? 1 : 0) : r() < 0.25 ? 1 : 0;
   for (let i = 0; i < np; i++) pauses.push(0.18 + r() * 0.6);
 
-  const points: TrackPoint[] = [];
+  const points: [number, number, number, number][] = []; // [lng, lat, ele, t]
   let s = 0, t = 0, warm = 0;
   let jitLat = 0, jitLng = 0;
   let hrSum = 0, hrN = 0, hrMax = 0;
+  const hrSeries: [number, number][] = [];
   const dt = 4;
   let pauseUntil = -1;
   let pauseLeft = 0;
@@ -180,6 +184,7 @@ function simulate(o: SimOpts): { points: TrackPoint[]; avgHr: number; maxHr: num
     hr = Math.max(o.restHr + 8, Math.min(o.maxHr - 2, hr));
     hrSum += hr; hrN++;
     hrMax = Math.max(hrMax, hr);
+    hrSeries.push([Math.round(t), Math.round(hr)]);
     points.push([p[0] + jitLng, p[1] + jitLat, eleAt(frac), Math.round(t)]);
   }
 
@@ -198,18 +203,16 @@ function simulate(o: SimOpts): { points: TrackPoint[]; avgHr: number; maxHr: num
   const stats = trackStats(points.map((p) => ({ lng: p[0], lat: p[1], ele: p[2], t: p[3] })));
   const movingH = stats.movingS / 3600;
   const calories = Math.round(o.met * o.weightKg * movingH * 1.05);
-  const intensity = avgHr ? (avgHr - o.restHr) / (o.maxHr - o.restHr) : 0.6;
-  const relEffort = Math.round(Math.max(1, intensity * movingH * 200));
   return {
     points: points.map((p) => ({ lng: p[0], lat: p[1], ele: p[2], t: p[3] })),
-    avgHr, maxHr: Math.round(hrMax), calories, relEffort,
+    hrSeries, avgHr, maxHr: Math.round(hrMax), calories,
   };
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 async function main() {
   console.log("Clearing database...");
-  const tabNames = ["Notification", "Comment", "Kudos", "SegmentEffort", "SegmentStar", "EventAttendance", "ClubEvent", "ClubMembership", "Club", "ChallengeEntry", "Challenge", "Goal", "Gear", "Route", "Track", "Split", "Lap", "Post", "Activity", "AthleteFollow", "Session", "Segment", "Athlete"];
+  const tabNames = ["Notification", "Comment", "Kudos", "SegmentEffort", "SegmentStar", "EventAttendance", "ClubEvent", "ClubMembership", "Club", "ChallengeEntry", "Challenge", "Goal", "Gear", "Route", "Track", "Split", "Lap", "Post", "Activity", "AthleteFollow", "Session", "Segment", "Report", "PasswordReset", "Athlete"];
   for (const t of tabNames) await (db as any)[t].deleteMany({});
 
   const geoms = await fetchRouteGeometries();
@@ -281,6 +284,14 @@ async function main() {
     const splits = computeSplits(tps, 1000);
     const title = opts.title ?? pick(TITLES[opts.sport] ?? TITLES.run);
     const description = opts.description === undefined ? (rnd() < 0.35 ? pick(DESCS) : null) : opts.description;
+    // demo athletes with a watch (the premium ones) record heart rate; the rest
+    // have none, exactly like phone-only users
+    const hasStrap = spec.premium;
+    const perceivedEffort = Math.max(1, Math.min(10, Math.round((opts.effort ?? 0.75) * 10)));
+    const effort = trainingLoad({
+      sport: opts.sport, movingS: stats.movingS, hrSeries: hasStrap ? sim.hrSeries : null,
+      perceivedEffort: hasStrap ? null : perceivedEffort, maxHr: spec.maxHr,
+    });
     const activity = await db.activity.create({
       data: {
         athleteId, sport: opts.sport, title, description,
@@ -288,20 +299,24 @@ async function main() {
         distanceM: stats.distanceM, movingTimeS: Math.round(stats.movingS), elapsedTimeS: Math.round(stats.elapsedS),
         elevationM: elevationGain(tps.map((p) => p.ele)),
         startLat: tps[0].lat, startLng: tps[0].lng, endLat: tps[tps.length - 1].lat, endLng: tps[tps.length - 1].lng,
-        avgSpeed: stats.avgSpeed, maxSpeed: stats.maxSpeed, avgHr: sim.avgHr, maxHr: sim.maxHr,
-        calories: sim.calories, relativeEffort: sim.relEffort,
-        perceivedEffort: Math.max(1, Math.min(10, Math.round((opts.effort ?? 0.75) * 10))),
+        avgSpeed: stats.avgSpeed, maxSpeed: stats.maxSpeed,
+        avgHr: hasStrap ? sim.avgHr : null, maxHr: hasStrap ? sim.maxHr : null,
+        calories: sim.calories, relativeEffort: effort.load, effortSource: effort.source,
+        perceivedEffort,
         visibility: opts.visibility ?? "everyone", isCommute: opts.isCommute ?? false,
         gearId: opts.gearId ?? null, photo: opts.photo ?? null,
-        deviceName: spec.premium ? "Garmin Forerunner 965" : "STRIDE App",
-        track: { create: { points: encodeTrack(tps) } },
+        deviceName: hasStrap ? "Garmin Forerunner 965" : "STRIDE App",
+        track: { create: { points: encodeTrack(tps), hrPoints: hasStrap ? JSON.stringify(sim.hrSeries) : null } },
         splits: {
-          create: splits.map((s) => ({
-            index: s.index, distanceM: s.distanceM, timeS: Math.round(s.timeS),
-            elevationDiff: Math.round(s.elevationDiff),
-            avgHr: Math.round((sim.avgHr ?? 140) + (s.paceZone * 3) - 4 + rnd() * 6),
-            paceZone: s.paceZone,
-          })),
+          create: splits.map((s) => {
+            const inSplit = sim.hrSeries.filter(([t]) => t >= s.tStart && t <= s.tEnd);
+            return {
+              index: s.index, distanceM: s.distanceM, timeS: Math.round(s.timeS),
+              elevationDiff: Math.round(s.elevationDiff),
+              avgHr: hasStrap && inSplit.length ? Math.round(inSplit.reduce((a, x) => a + x[1], 0) / inSplit.length) : null,
+              paceZone: s.paceZone,
+            };
+          }),
         },
         ...(opts.laps
           ? { laps: { create: splits.map((s) => ({ index: s.index, distanceM: s.distanceM, timeS: Math.round(s.timeS) })) } }
@@ -368,12 +383,17 @@ async function main() {
       visibility: daysAgo === 11 ? "followers" : "everyone",
     });
   }
-  // Alex indoor/no-track activities
+  // Alex indoor/no-track activities (his watch measured heart rate)
+  const indoorLoad = (sport: string, movingS: number, avgHr: number) => {
+    const e = trainingLoad({ sport, movingS, avgHr, maxHr: me.spec.maxHr });
+    return { relativeEffort: e.load, effortSource: e.source };
+  };
   await db.activity.create({
     data: {
       athleteId: me.id, sport: "gym", title: "Strength Training", description: "Squats + core. Feeling it.",
       startDate: daysAgo(5), tzOffsetMin: 360, distanceM: 0, movingTimeS: 2760, elapsedTimeS: 3300,
-      elevationM: 0, avgHr: 112, maxHr: 145, calories: 322, relativeEffort: 46, perceivedEffort: 6,
+      elevationM: 0, avgHr: 112, maxHr: 145, calories: 322, perceivedEffort: 6,
+      ...indoorLoad("gym", 2760, 112),
       isTrainer: true, visibility: "everyone",
     },
   });
@@ -381,7 +401,8 @@ async function main() {
     data: {
       athleteId: me.id, sport: "yoga", title: "Recovery Yoga",
       startDate: daysAgo(7), tzOffsetMin: 360, distanceM: 0, movingTimeS: 2400, elapsedTimeS: 2400,
-      elevationM: 0, avgHr: 84, maxHr: 102, calories: 118, relativeEffort: 12, perceivedEffort: 2,
+      elevationM: 0, avgHr: 84, maxHr: 102, calories: 118, perceivedEffort: 2,
+      ...indoorLoad("yoga", 2400, 84),
       isTrainer: true, visibility: "everyone",
     },
   });
@@ -389,7 +410,8 @@ async function main() {
     data: {
       athleteId: me.id, sport: "swim", title: "Pool Swim", description: "2k straight, steady.",
       startDate: daysAgo(12), tzOffsetMin: 360, distanceM: 2000, movingTimeS: 3180, elapsedTimeS: 3180,
-      elevationM: 0, avgHr: 138, maxHr: 162, calories: 486, relativeEffort: 82, perceivedEffort: 7,
+      elevationM: 0, avgHr: 138, maxHr: 162, calories: 486, perceivedEffort: 7,
+      ...indoorLoad("swim", 3180, 138),
       isTrainer: true, visibility: "everyone", deviceName: "Garmin Forerunner 965",
     },
   });
@@ -507,29 +529,29 @@ async function main() {
   for (const e of effortsToCreate) {
     await db.segmentEffort.create({ data: e });
   }
-  // compute PRs and ranks
+  // PRs per athlete; leaderboard ranks over public efforts, as the app computes them
   for (const seg of segments) {
     const efforts = await db.segmentEffort.findMany({ where: { segmentId: seg.id }, orderBy: { timeS: "asc" } });
-    const bestPerAthlete = new Map<string, number>();
-    efforts.forEach((e, i) => {
+    const bestPerAthlete = new Map<string, { timeS: number; id: string }>();
+    for (const e of efforts) {
       const best = bestPerAthlete.get(e.athleteId);
-      if (best === undefined || e.timeS < best) bestPerAthlete.set(e.athleteId, e.id);
-      db.segmentEffort.update({ where: { id: e.id }, data: { rank: i + 1 } }).catch(() => {});
-    });
-    for (const [athleteId, effortId] of bestPerAthlete) {
+      if (best === undefined || e.timeS < best.timeS) bestPerAthlete.set(e.athleteId, { timeS: e.timeS, id: e.id });
+    }
+    for (const { id: effortId } of bestPerAthlete.values()) {
       await db.segmentEffort.update({ where: { id: effortId }, data: { isPR: true } });
     }
   }
+  await rerankSegments(segments.map((g) => g.id));
   console.log(`Created ${effortsToCreate.length} segment efforts`);
 
   console.log("Creating clubs...");
   const clubSpecs = [
-    { slug: "dhaka-runners", name: "Dhaka Runners", sport: "running", city: "Dhaka", country: "Bangladesh", coverColor: "#fc4c02", accentColor: "#242427", description: "The original Dhaka running community. Track nights Wednesdays, long runs Sundays, all paces welcome.", members: ["Alex", "Nusrat", "Farhana", "Priya", "Ravi"], memberCount: 3212 },
-    { slug: "bdcyclists", name: "BDCyclists", sport: "cycling", city: "Dhaka", country: "Bangladesh", coverColor: "#242427", accentColor: "#fc4c02", description: "Bangladesh's largest cycling community. Rides every weekend from Hatirjheel. Lights on, helmets on.", members: ["Tanvir", "Imran", "Shafiq", "Alex"], memberCount: 14875 },
-    { slug: "hatirjheel-morning-crew", name: "Hatirjheel Morning Crew", sport: "cycling", city: "Dhaka", country: "Bangladesh", coverColor: "#2c7f8f", accentColor: "#e8e8ea", description: "5 AM starts, 3 laps, coffee after. The early crew owns the lake.", members: ["Tanvir", "Imran", "Alex", "Ravi"], memberCount: 843 },
-    { slug: "gulshan-lake-striders", name: "Gulshan Lake Striders", sport: "running", city: "Dhaka", country: "Bangladesh", coverColor: "#b0486a", accentColor: "#242427", description: "Sunrise runs around Gulshan-Banani lake. Beginners to Boston qualifiers.", members: ["Nusrat", "Farhana", "Priya", "Alex"], memberCount: 967 },
-    { slug: "trail-bangladesh", name: "Trail Bangladesh", sport: "multi", city: "Dhaka", country: "Bangladesh", coverColor: "#3d7a4f", accentColor: "#e8e8ea", description: "Finding and running the trails of Bangladesh — Gazipur, Bhawal, Bandarban.", members: ["Ravi", "Sarah", "Priya"], memberCount: 1102 },
-    { slug: "dhaka-tri-club", name: "Dhaka Tri Club", sport: "triathlon", city: "Dhaka", country: "Bangladesh", coverColor: "#5a6472", accentColor: "#fc4c02", description: "Swim, bike, run — brick by brick. Pool sessions Mondays and Thursdays.", members: ["Ravi", "Jack", "Alex"], memberCount: 389 },
+    { slug: "dhaka-runners", name: "Dhaka Runners", sport: "running", city: "Dhaka", country: "Bangladesh", coverColor: "#fc4c02", accentColor: "#242427", description: "The original Dhaka running community. Track nights Wednesdays, long runs Sundays, all paces welcome.", members: ["Alex", "Nusrat", "Farhana", "Priya", "Ravi"] },
+    { slug: "bdcyclists", name: "BDCyclists", sport: "cycling", city: "Dhaka", country: "Bangladesh", coverColor: "#242427", accentColor: "#fc4c02", description: "Bangladesh's largest cycling community. Rides every weekend from Hatirjheel. Lights on, helmets on.", members: ["Tanvir", "Imran", "Shafiq", "Alex"] },
+    { slug: "hatirjheel-morning-crew", name: "Hatirjheel Morning Crew", sport: "cycling", city: "Dhaka", country: "Bangladesh", coverColor: "#2c7f8f", accentColor: "#e8e8ea", description: "5 AM starts, 3 laps, coffee after. The early crew owns the lake.", members: ["Tanvir", "Imran", "Alex", "Ravi"] },
+    { slug: "gulshan-lake-striders", name: "Gulshan Lake Striders", sport: "running", city: "Dhaka", country: "Bangladesh", coverColor: "#b0486a", accentColor: "#242427", description: "Sunrise runs around Gulshan-Banani lake. Beginners to Boston qualifiers.", members: ["Nusrat", "Farhana", "Priya", "Alex"] },
+    { slug: "trail-bangladesh", name: "Trail Bangladesh", sport: "multi", city: "Dhaka", country: "Bangladesh", coverColor: "#3d7a4f", accentColor: "#e8e8ea", description: "Finding and running the trails of Bangladesh — Gazipur, Bhawal, Bandarban.", members: ["Ravi", "Sarah", "Priya"] },
+    { slug: "dhaka-tri-club", name: "Dhaka Tri Club", sport: "triathlon", city: "Dhaka", country: "Bangladesh", coverColor: "#5a6472", accentColor: "#fc4c02", description: "Swim, bike, run — brick by brick. Pool sessions Mondays and Thursdays.", members: ["Ravi", "Jack", "Alex"] },
   ];
   const clubs: Record<string, string> = {};
   for (const c of clubSpecs) {
@@ -547,7 +569,8 @@ async function main() {
         data: { clubId: row.id, athleteId: byFirst(m).id, role: i === 0 ? "owner" : "member" },
       });
     }
-    await db.club.update({ where: { id: row.id }, data: { memberCount: c.memberCount } });
+    // counts are real: the members that exist
+    await db.club.update({ where: { id: row.id }, data: { memberCount: c.members.length } });
   }
 
   console.log("Creating club events...");
@@ -589,14 +612,14 @@ async function main() {
 
   console.log("Creating challenges...");
   const chSpecs = [
-    { slug: "october-run-100", title: "October Running Challenge", desc: "Run 100 km between October 1 and October 31.", cat: "run", type: "distance", goal: 100, badge: "award", accent: "#fc4c02", featured: true, joined: 1243 },
-    { slug: "october-ride-250", title: "October Ride Challenge", desc: "Ride 250 km this month. Every pedal stroke counts.", cat: "ride", type: "distance", goal: 250, badge: "bike", accent: "#242427", featured: true, joined: 892 },
-    { slug: "october-walk-100", title: "October Walking Challenge", desc: "Walk 100 km this month. Step by step.", cat: "walk", type: "distance", goal: 100, badge: "footprints", accent: "#8a6d3b", joined: 2314 },
-    { slug: "monthly-gran-fondo", title: "Monthly Gran Fondo", desc: "Ride 130 km in a single activity this month.", cat: "ride", type: "single_distance", goal: 130, badge: "mountain", accent: "#404046", featured: true, joined: 318 },
-    { slug: "october-climb-2000", title: "October Climbing Challenge", desc: "Gain 2,000 m of elevation across all activities.", cat: "general", type: "elevation", goal: 2000, badge: "mountain", accent: "#3d7a4f", joined: 567 },
-    { slug: "october-yoga", title: "October Yoga Challenge", desc: "15 yoga sessions this month. Flexibility is fitness.", cat: "yoga", type: "activities", goal: 15, badge: "flower2", accent: "#8a5d7a", joined: 445 },
-    { slug: "october-5k", title: "October 5K Challenge", desc: "Run 5 km in a single activity this month.", cat: "run", type: "single_distance", goal: 5, badge: "zap", accent: "#b0486a", joined: 1876 },
-    { slug: "october-gravel-100", title: "October Gravel Challenge", desc: "Ride 100 km of gravel this month.", cat: "ride", type: "distance", goal: 100, badge: "mountain", accent: "#7a5c3e", joined: 203 },
+    { slug: "october-run-100", title: "October Running Challenge", desc: "Run 100 km between October 1 and October 31.", cat: "run", type: "distance", goal: 100, badge: "award", accent: "#fc4c02", featured: true },
+    { slug: "october-ride-250", title: "October Ride Challenge", desc: "Ride 250 km this month. Every pedal stroke counts.", cat: "ride", type: "distance", goal: 250, badge: "bike", accent: "#242427", featured: true },
+    { slug: "october-walk-100", title: "October Walking Challenge", desc: "Walk 100 km this month. Step by step.", cat: "walk", type: "distance", goal: 100, badge: "footprints", accent: "#8a6d3b" },
+    { slug: "monthly-gran-fondo", title: "Monthly Gran Fondo", desc: "Ride 130 km in a single activity this month.", cat: "ride", type: "single_distance", goal: 130, badge: "mountain", accent: "#404046", featured: true },
+    { slug: "october-climb-2000", title: "October Climbing Challenge", desc: "Gain 2,000 m of elevation across all activities.", cat: "general", type: "elevation", goal: 2000, badge: "mountain", accent: "#3d7a4f" },
+    { slug: "october-yoga", title: "October Yoga Challenge", desc: "15 yoga sessions this month. Flexibility is fitness.", cat: "yoga", type: "activities", goal: 15, badge: "flower2", accent: "#8a5d7a" },
+    { slug: "october-5k", title: "October 5K Challenge", desc: "Run 5 km in a single activity this month.", cat: "run", type: "single_distance", goal: 5, badge: "zap", accent: "#b0486a" },
+    { slug: "october-gravel-100", title: "October Gravel Challenge", desc: "Ride 100 km of gravel this month.", cat: "ride", type: "distance", goal: 100, badge: "mountain", accent: "#7a5c3e" },
   ];
   const challengeIds: Record<string, string> = {};
   for (const c of chSpecs) {
@@ -606,7 +629,7 @@ async function main() {
       data: {
         slug: c.slug, title: c.title, description: c.desc, category: c.cat, type: c.type,
         goalValue: c.goal, period: "monthly", startDate: start, endDate: end,
-        badgeIcon: c.badge, accentColor: c.accent, joinedCount: c.joined, featured: !!c.featured,
+        badgeIcon: c.badge, accentColor: c.accent, joinedCount: 0, featured: !!c.featured,
       },
     });
     challengeIds[c.slug] = row.id;
@@ -616,7 +639,10 @@ async function main() {
     for (const j of joiners) {
       await db.challengeEntry.create({ data: { challengeId: id, athleteId: byFirst(j).id } });
     }
+    await db.challenge.update({ where: { id }, data: { joinedCount: joiners.length } });
   }
+  // completion is evaluated the same way the app does after each activity
+  for (const a of Object.values(athletes)) await evaluateChallenges(a.id);
 
   console.log("Creating routes & goals & posts...");
   for (const rid of ["hatirjheel", "gulshan_lake", "gazipur", "bashundhara"]) {
@@ -633,8 +659,9 @@ async function main() {
       },
     });
   }
-  await db.goal.create({ data: { athleteId: me.id, metric: "distance", target: 40, sport: "run" } });
-  await db.goal.create({ data: { athleteId: me.id, metric: "distance", target: 60, sport: "ride" } });
+  // goal targets are SI: metres
+  await db.goal.create({ data: { athleteId: me.id, metric: "distance", target: 40000, sport: "run" } });
+  await db.goal.create({ data: { athleteId: me.id, metric: "distance", target: 60000, sport: "ride" } });
 
   const postSpecs: Array<[string, string, number]> = [
     ["Nusrat", "Race week! Taper mode engaged. Easy laps around Gulshan this morning, legs feeling springy. See you at the start line on Sunday.", 1],
@@ -704,15 +731,13 @@ async function main() {
     { type: "comment", actor: "Tanvir", activityId: latestRide?.id, agoH: 8, text: "Clean lap splits on that one" },
     { type: "comment", actor: "Farhana", activityId: latestRun?.id, agoH: 9, text: "You're flying lately" },
     { type: "follow", actor: "Aisha", agoH: 26 },
-    { type: "challenge_milestone", text: "You're 45% of the way to the October Running Challenge", challengeId: challengeIds["october-run-100"], agoH: 30 },
     { type: "club_join", actor: "Imran", clubId: clubs["hatirjheel-morning-crew"], text: "Imran joined Hatirjheel Morning Crew", agoH: 50 },
-    { type: "segment_record", text: "New personal record on Gulshan Lake 1K", agoH: 60 },
   ];
   for (const n of notifSpecs) {
     await db.notification.create({
       data: {
         recipientId: me.id, actorId: n.actor ? byFirst(n.actor).id : null,
-        type: n.type, activityId: n.activityId ?? null, challengeId: n.challengeId ?? null,
+        type: n.type, activityId: n.activityId ?? null,
         clubId: n.clubId ?? null, text: n.text ?? null,
         read: n.agoH > 40,
         createdAt: new Date(Date.now() - n.agoH * 3600000),
@@ -720,14 +745,8 @@ async function main() {
     });
   }
 
-  // gear mileage from activities
-  await db.gear.update({ where: { id: ghost.id }, data: { distanceM: 312400 } });
-  await db.gear.update({ where: { id: pegasus.id }, data: { distanceM: 88600 } });
-  await db.gear.update({ where: { id: domane.id }, data: { distanceM: 1286100 } });
-  await db.gear.update({ where: { id: kayano.id }, data: { distanceM: 640200, retired: true } });
-  await db.gear.update({ where: { id: tanvirBike.id }, data: { distanceM: 4218700 } });
-  await db.gear.update({ where: { id: nusratShoes.id }, data: { distanceM: 209800 } });
-  await db.gear.update({ where: { id: sarahShoes.id }, data: { distanceM: 455300 } });
+  // gear mileage is the sum of the activities that used it
+  await refreshGearDistance([ghost.id, pegasus.id, domane.id, kayano.id, tanvirBike.id, nusratShoes.id, sarahShoes.id]);
 
   const counts = {
     athletes: await db.athlete.count(),

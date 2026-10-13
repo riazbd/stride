@@ -148,15 +148,19 @@ export function LineAreaChart({
 
 // ── Elevation + Pace analysis charts ────────────────────────────────────────
 export function AnalysisChart({
-  series, kind, units, height,
+  series, kind, units, height, speedMode = false,
 }: {
-  series: { t: number; d: number; ele: number; pace: number | null; hr: number; gap: number | null }[];
-  kind: "elevation" | "pace" | "hr" | "gap";
+  series: { t: number; d: number; ele: number; pace: number | null; hr: number | null; gap: number | null; watts?: number | null }[];
+  kind: "elevation" | "pace" | "hr" | "gap" | "power";
   units: Units;
   height?: number;
+  speedMode?: boolean; // rides etc: plot speed instead of pace
 }) {
   const chart = useMemo(() => {
     if (!series.length) return null;
+    // series pace is seconds per km — convert to the athlete's unit
+    const perUnit = (secPerKm: number) => (units === "km" ? secPerKm : secPerKm * (MI / 1000));
+    const speedOfPace = (secPerKm: number) => (units === "km" ? 3600 / secPerKm : 3600 / secPerKm / (MI / 1000));
     if (kind === "elevation") {
       return {
         series: [{ points: series.map((p) => ({ x: p.d, y: p.ele })), color: "var(--chart-1)", fill: "color-mix(in srgb, var(--primary) 14%, transparent)", width: 2 }],
@@ -165,8 +169,28 @@ export function AnalysisChart({
         xFormatter: (v: number) => `${fmtDist(v, units, 1)} ${distUnit(units)}`,
       };
     }
+    if (kind === "pace" && speedMode) {
+      const pts = series.filter((p) => p.pace != null).map((p) => ({ x: p.d, y: speedOfPace(p.pace!) }));
+      if (!pts.length) return null;
+      return {
+        series: [{ points: pts, color: "var(--chart-1)", width: 2 }],
+        yLabel: "Speed",
+        yFormatter: (v: number) => `${v.toFixed(1)} ${units === "km" ? "km/h" : "mph"}`,
+        xFormatter: (v: number) => `${fmtDist(v, units, 1)} ${distUnit(units)}`,
+      };
+    }
+    if (kind === "power") {
+      const pts = series.filter((p) => p.watts != null).map((p) => ({ x: p.d, y: p.watts! }));
+      if (!pts.length) return null;
+      return {
+        series: [{ points: pts, color: "#7a5c9e", width: 2 }],
+        yLabel: "Power",
+        yFormatter: (v: number) => `${Math.round(v)} W`,
+        xFormatter: (v: number) => `${fmtDist(v, units, 1)} ${distUnit(units)}`,
+      };
+    }
     if (kind === "pace") {
-      const pts = series.filter((p) => p.pace != null).map((p) => ({ x: p.d, y: p.pace! }));
+      const pts = series.filter((p) => p.pace != null).map((p) => ({ x: p.d, y: perUnit(p.pace!) }));
       if (!pts.length) return null;
       // invert pace (lower = faster = better) → chart shows like Strava (lower dips)
       return {
@@ -177,7 +201,7 @@ export function AnalysisChart({
       };
     }
     if (kind === "gap") {
-      const pts = series.filter((p) => p.gap != null).map((p) => ({ x: p.d, y: p.gap! }));
+      const pts = series.filter((p) => p.gap != null).map((p) => ({ x: p.d, y: perUnit(p.gap!) }));
       if (!pts.length) return null;
       return {
         series: [{ points: pts, color: "#242427", width: 2 }],
@@ -187,12 +211,12 @@ export function AnalysisChart({
       };
     }
     return {
-      series: [{ points: series.map((p) => ({ x: p.d, y: p.hr })), color: "#d5302a", width: 2 }],
+      series: [{ points: series.filter((p) => p.hr != null).map((p) => ({ x: p.d, y: p.hr as number })), color: "#d5302a", width: 2 }],
       yLabel: "HR",
       yFormatter: (v: number) => `${Math.round(v)} bpm`,
       xFormatter: (v: number) => `${fmtDist(v, units, 1)} ${distUnit(units)}`,
     };
-  }, [series, kind, units]);
+  }, [series, kind, units, speedMode]);
 
   if (!chart) return <div className="h-[130px] flex items-center justify-center text-[12px] text-muted-foreground">No data</div>;
   return <LineAreaChart series={chart.series} height={height ?? 130} yLabel={chart.yLabel} yFormatter={chart.yFormatter} xFormatter={chart.xFormatter} />;
@@ -266,11 +290,13 @@ export function WeeklyBars({
 }) {
   if (!data.length) return null;
   const W = 360, H = 160, padB = 18, padT = 24;
-  const vals = data.map((d) => d.distanceM / 1000);
-  const maxV = Math.max(...vals, goal ?? 0, 1) * 1.15;
+  // goal arrives in metres; bars and goal line are drawn in the athlete's units
+  const vals = data.map((d) => d.distanceM / (units === "km" ? 1000 : MI));
+  const goalV = goal ? goal / (units === "km" ? 1000 : MI) : undefined;
+  const maxV = Math.max(...vals, goalV ?? 0, 1) * 1.15;
   const bw = (W - 8) / data.length;
   const barW = Math.min(26, bw - 8);
-  const goalY = goal ? padT + (1 - goal / maxV) * (H - padT - padB) : null;
+  const goalY = goalV ? padT + (1 - goalV / maxV) * (H - padT - padB) : null;
   return (
     <div className="relative">
       <svg viewBox={`0 0 ${W} ${H}`} style={{ height }} className="w-full">
@@ -286,14 +312,14 @@ export function WeeklyBars({
                 x={4 + i * bw + (bw - barW) / 2} y={y}
                 width={barW} height={Math.max(2, H - padB - y)}
                 rx={3}
-                fill={goal && v >= goal ? "var(--primary)" : "color-mix(in srgb, var(--primary) 32%, var(--muted))"}
+                fill={goalV && v >= goalV ? "var(--primary)" : "color-mix(in srgb, var(--primary) 32%, var(--muted))"}
               />
             </g>
           );
         })}
       </svg>
       <div className="absolute top-0 right-1 text-[10px] text-muted-foreground font-medium">
-        {goal ? `Goal ${goal} ${distUnit(units)}` : ""}
+        {goalV ? `Goal ${Math.round(goalV)} ${distUnit(units)}` : ""}
       </div>
     </div>
   );

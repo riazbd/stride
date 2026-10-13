@@ -50,8 +50,11 @@ export interface Activity {
   maxSpeed: number | null;
   avgHr: number | null;
   maxHr: number | null;
+  avgWatts?: number | null;
+  maxWatts?: number | null;
   calories: number | null;
   relativeEffort: number | null;
+  effortSource?: "hr" | "rpe" | "estimate" | null;
   perceivedEffort: number | null;
   visibility: string;
   isCommute: boolean;
@@ -317,7 +320,7 @@ export interface FitnessPoint {
 
 export interface WeeklyProgress {
   week: PeriodStats;
-  goals: { id: string; metric: string; target: number; sport: string | null; currentM: number }[];
+  goals: { id: string; metric: string; target: number; sport: string | null; current: number }[]; // SI
   streak: number;
   weekStart: string;
 }

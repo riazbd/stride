@@ -1,12 +1,13 @@
 "use client";
 import { create } from "zustand";
-import { haversineM, elevationGain } from "@/lib/geo";
+import { haversineM, trackStats, computeSplits, type Pause, type TrackPoint } from "@/lib/geo";
+import { saveRecording, loadRecording, clearRecording } from "@/lib/rec-store";
 
 export interface RecPoint {
   lng: number;
   lat: number;
   ele: number;
-  t: number; // seconds since start (elapsed clock)
+  t: number; // seconds since start on the wall clock (elapsed, pauses included)
 }
 
 export interface RecSplit {
@@ -18,8 +19,10 @@ export interface RecSplit {
 }
 
 export interface RecDraft {
+  clientId: string; // lets the server recognise a retried upload of the same activity
   sport: string;
   points: [number, number, number, number][];
+  pauses: Pause[];
   movingTimeS: number;
   elapsedTimeS: number;
   distanceM: number;
@@ -30,6 +33,9 @@ export interface RecDraft {
   avgHr: number | null;
   maxHr: number | null;
   hrSeries: [number, number][] | null; // [t, hr] samples from a live sensor
+  avgWatts: number | null;
+  maxWatts: number | null;
+  powerSeries: [number, number][] | null; // [t, watts] samples from a power meter
 }
 
 type GPSStatus = "off" | "searching" | "ok" | "weak";
@@ -41,8 +47,8 @@ interface RecorderState {
   splits: RecSplit[];
   laps: { distanceM: number; timeS: number }[];
   startDate: number | null;
-  elapsedMs: number;
-  movingMs: number;
+  elapsedMs: number; // wall clock since start, pauses included (Strava "elapsed")
+  movingMs: number; // excludes manual and auto pauses
   distanceM: number;
   elevationM: number;
   currentSpeed: number;
@@ -55,13 +61,23 @@ interface RecorderState {
   _timer: any;
   _watch: number | null;
   _wakeLock: any;
-  _hrSamples: { t: number; hr: number }[];
+  _hrSamples: { t: number; v: number }[];
+  _powerSamples: { t: number; v: number }[];
   noteHr: (hr: number) => void;
-  _pauseAccumMs: number;
+  notePower: (watts: number) => void;
+  _pauses: Pause[];
+  _pausedAtMs: number | null;
+  _gapNext: boolean; // next fix starts a fresh stretch (first fix after a manual pause)
+  _rejects: number; // consecutive fixes rejected as teleports
   _lastTickMs: number;
   _lastMoveAtMs: number;
-  _eleHistory: number[];
+  _lastEle: number | null;
+  _eleRef: number | null;
   _prevSplitTimeS: number;
+  _splitStartEle: number | null;
+  _lapStart: { distanceM: number; timeS: number };
+  _clientId: string;
+  _lastPersistMs: number;
   start: (sport: string, autoPause: boolean) => void;
   pause: () => void;
   resume: () => void;
@@ -73,6 +89,14 @@ interface RecorderState {
 }
 
 const AUTO_PAUSE_AFTER_MS = 8000;
+const ELE_THRESHOLD_M = 2; // same hysteresis as geo.elevationGain
+const FOOT_SPORTS = ["run", "trail_run", "walk", "hike", "virtual_run"];
+
+// fastest believable speed between two fixes — anything quicker is a GPS jump
+const maxSpeedFor = (sport: string) => (FOOT_SPORTS.includes(sport) ? 12 : 40);
+
+const elapsedS = (st: { startDate: number | null }, now = Date.now()) =>
+  Math.max(0, Math.round(((now - (st.startDate ?? now)) / 1000) * 10) / 10);
 
 function stopInternal() {
   const st = useRecorder.getState();
@@ -81,194 +105,289 @@ function stopInternal() {
   try { st._wakeLock?.release?.(); } catch { /* noop */ }
   useRecorder.setState({ _timer: null, _watch: null, _wakeLock: null });
   document.removeEventListener("visibilitychange", onVisible);
+  window.removeEventListener("pagehide", persistNow);
 }
 
 function onVisible() {
-  if (document.visibilityState === "visible" && useRecorder.getState().state === "recording") {
+  const st = useRecorder.getState();
+  // the browser may freeze or kill a hidden tab: save before that happens
+  if (document.visibilityState === "hidden") persistNow();
+  if (document.visibilityState === "visible" && st.state === "recording") {
     const nav: any = navigator;
     nav.wakeLock?.request?.("screen").then((wl: any) => useRecorder.setState({ _wakeLock: wl })).catch(() => {});
   }
 }
 
+// ── Crash safety ─────────────────────────────────────────────────────────────
+// Everything needed to carry on is written to IndexedDB every few seconds and
+// on every pause, lap, finish and tab hide. Lost at most: the last 5 seconds.
+
+const PERSIST_EVERY_MS = 5000;
+
+const SNAPSHOT_KEYS = [
+  "state", "sport", "points", "splits", "laps", "startDate", "elapsedMs", "movingMs", "distanceM",
+  "elevationM", "autoPause", "lastSplitAt", "finishedDraft", "_hrSamples", "_powerSamples", "_pauses",
+  "_pausedAtMs", "_lastEle", "_eleRef", "_prevSplitTimeS", "_splitStartEle", "_lapStart", "_clientId",
+] as const;
+
+type Snapshot = Pick<RecorderState, (typeof SNAPSHOT_KEYS)[number]> & { v: 1; savedAtMs: number };
+
+function persistNow() {
+  const st = useRecorder.getState();
+  if (st.state === "idle") return;
+  const snap: any = { v: 1, savedAtMs: Date.now() };
+  for (const k of SNAPSHOT_KEYS) snap[k] = st[k];
+  useRecorder.setState({ _lastPersistMs: snap.savedAtMs });
+  void saveRecording(snap);
+}
+
+// On app start: bring back an activity a closed or crashed tab left behind.
+// A recording comes back paused at the moment it was last saved (the time the
+// app was gone counts as paused); a finished one comes back ready to upload.
+// Returns where to send the athlete, or null when there's nothing to recover.
+export async function recoverRecording(): Promise<"recording" | "saveActivity" | null> {
+  if (useRecorder.getState().state !== "idle") return null;
+  const snap = await loadRecording<Snapshot>();
+  if (!snap || snap.v !== 1) return null;
+  const { v: _v, savedAtMs, ...rest } = snap;
+  if (rest.state === "finished") {
+    if (!rest.finishedDraft) { await clearRecording(); return null; }
+    useRecorder.setState({ ...rest, state: "finished" });
+    return "saveActivity";
+  }
+  if (rest.state !== "recording" && rest.state !== "paused") return null;
+  if (!rest.points.length) { await clearRecording(); return null; }
+  const pausedAt = rest.state === "paused" && rest._pausedAtMs ? rest._pausedAtMs : savedAtMs;
+  useRecorder.setState({ ...rest, state: "paused", _pausedAtMs: pausedAt, currentSpeed: 0, autoPaused: false, gpsStatus: "searching" });
+  startGps();
+  startTicker();
+  return "recording";
+}
+
+function newClientId(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+// ticks while recording *and* paused, so elapsed time keeps running like Strava's
 function startTicker() {
   const timer = setInterval(() => {
     const st = useRecorder.getState();
-    if (st.state !== "recording") return;
+    if (st.state !== "recording" && st.state !== "paused") return;
     const now = Date.now();
     const dt = now - st._lastTickMs;
-    const shouldAutoPause = st.autoPause && now - st._lastMoveAtMs > AUTO_PAUSE_AFTER_MS;
-    const wasAutoPaused = st.autoPaused;
+    const recording = st.state === "recording";
+    const autoPaused = recording && st.autoPause && now - st._lastMoveAtMs > AUTO_PAUSE_AFTER_MS;
     useRecorder.setState({
       _lastTickMs: now,
-      elapsedMs: now - (st.startDate ?? now) - st._pauseAccumMs,
-      movingMs: shouldAutoPause ? st.movingMs : st.movingMs + dt,
-      _pauseAccumMs: shouldAutoPause ? st._pauseAccumMs + dt : st._pauseAccumMs,
-      autoPaused: shouldAutoPause,
-      currentSpeed: shouldAutoPause ? 0 : st.currentSpeed,
+      elapsedMs: now - (st.startDate ?? now),
+      movingMs: recording && !autoPaused ? st.movingMs + dt : st.movingMs,
+      autoPaused,
+      currentSpeed: recording && !autoPaused ? st.currentSpeed : 0,
     });
-    if (shouldAutoPause !== wasAutoPaused) useRecorder.setState({ autoPaused: shouldAutoPause });
+    if (now - st._lastPersistMs >= PERSIST_EVERY_MS) persistNow();
   }, 250);
   useRecorder.setState({ _timer: timer, _lastTickMs: Date.now() });
+  window.addEventListener("pagehide", persistNow);
+  document.addEventListener("visibilitychange", onVisible);
 }
 
+function startGps() {
+  const get = useRecorder.getState;
+  const set = useRecorder.setState;
+  if (!navigator.geolocation) {
+    set({ gpsStatus: "off" });
+    return;
+  }
+  const watch = navigator.geolocation.watchPosition(
+    (pos) => {
+      const st = get();
+      if (st.state === "idle" || st.state === "finished") return;
+      const { latitude, longitude, altitude, accuracy } = pos.coords;
+      if (accuracy == null || accuracy > 50) {
+        set({ gpsStatus: st.points.length ? "weak" : "searching", gpsAccuracy: accuracy ? Math.round(accuracy) : null });
+        return;
+      }
+      const gps = { gpsStatus: "ok" as GPSStatus, gpsAccuracy: Math.round(accuracy) };
+      // paused: keep the GPS warm but record nothing
+      if (st.state === "paused") { set(gps); return; }
+
+      const now = Date.now();
+      // devices that only sometimes report altitude would otherwise drop to 0 m
+      const ele = altitude != null && Number.isFinite(altitude) ? altitude : (st._lastEle ?? 0);
+      const point: RecPoint = { lng: longitude, lat: latitude, ele, t: elapsedS(st, now) };
+      const prev = st.points[st.points.length - 1];
+
+      // first fix, or first fix after a manual pause: a fresh stretch, no distance
+      if (!prev || st._gapNext) {
+        set({
+          ...gps,
+          points: [...st.points, point],
+          _gapNext: false, _rejects: 0, _lastMoveAtMs: now,
+          _lastEle: ele, _eleRef: st._eleRef ?? ele, _splitStartEle: st._splitStartEle ?? ele,
+        });
+        return;
+      }
+
+      const d = haversineM([prev.lng, prev.lat], [point.lng, point.lat]);
+      const dt = Math.max(0.5, point.t - prev.t);
+      const teleport = d / dt > maxSpeedFor(st.sport);
+      // a jump is rejected — unless 5 fixes in a row disagree with the last
+      // accepted one, in which case *that* fix was the bad one: re-anchor
+      if (teleport && st._rejects < 5) { set({ ...gps, _rejects: st._rejects + 1 }); return; }
+      // stationary wander: wait until we've clearly moved past the noise
+      const minStep = Math.max(3, Math.min(10, accuracy * 0.5));
+      if (!teleport && d < minStep) { set({ ...gps, _rejects: 0 }); return; }
+
+      set((cur) => {
+        const points = [...cur.points, point];
+        const step = teleport ? 0 : d;
+        const newDist = cur.distanceM + step;
+        // live elevation gain with the same hysteresis as the server
+        let elevationM = cur.elevationM;
+        let eleRef = cur._eleRef ?? ele;
+        if (ele - eleRef >= ELE_THRESHOLD_M) { elevationM += ele - eleRef; eleRef = ele; }
+        else if (ele - eleRef <= -ELE_THRESHOLD_M) eleRef = ele;
+        // live km splits
+        const splits = [...cur.splits];
+        let { _prevSplitTimeS: prevSplitTimeS, lastSplitAt, _splitStartEle: splitStartEle } = cur;
+        if (Math.floor(newDist / 1000) > Math.floor(cur.distanceM / 1000)) {
+          splits.push({
+            index: splits.length,
+            distanceM: 1000,
+            timeS: Math.round(cur.movingMs / 1000 - prevSplitTimeS),
+            elevationDiff: Math.round(ele - (splitStartEle ?? ele)),
+            paceZone: 0,
+          });
+          prevSplitTimeS = cur.movingMs / 1000;
+          splitStartEle = ele;
+          lastSplitAt = now;
+          if (navigator.vibrate) navigator.vibrate(60);
+        }
+        return {
+          ...gps,
+          points, splits, elevationM,
+          distanceM: newDist,
+          currentSpeed: teleport ? cur.currentSpeed : cur.currentSpeed * 0.7 + (d / dt) * 0.3,
+          _rejects: 0,
+          _lastMoveAtMs: now,
+          _lastEle: ele,
+          _eleRef: eleRef,
+          _prevSplitTimeS: prevSplitTimeS,
+          _splitStartEle: splitStartEle,
+          lastSplitAt,
+        };
+      });
+    },
+    () => {
+      const st = get();
+      set({ gpsStatus: st.points.length ? "weak" : "off" });
+    },
+    { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 }
+  );
+  set({ _watch: watch });
+}
+
+function seriesStats(samples: { t: number; v: number }[]) {
+  if (samples.length < 8) return { avg: null, max: null, series: null };
+  return {
+    avg: Math.round(samples.reduce((a, b) => a + b.v, 0) / samples.length),
+    max: Math.max(...samples.map((s) => s.v)),
+    series: samples.map((s) => [s.t, s.v] as [number, number]),
+  };
+}
+
+// append a live sensor reading, keeping only the freshest one per tenth-second
+function pushSample(samples: { t: number; v: number }[], t: number, v: number) {
+  const prev = samples[samples.length - 1];
+  if (prev && prev.t === t) return [...samples.slice(0, -1), { t, v }];
+  return [...samples, { t, v }];
+}
+
+const idle = {
+  state: "idle" as const, points: [], splits: [], laps: [], startDate: null,
+  elapsedMs: 0, movingMs: 0, distanceM: 0, elevationM: 0, currentSpeed: 0,
+  gpsStatus: "off" as GPSStatus, gpsAccuracy: null, autoPaused: false,
+  lastSplitAt: 0, finishedDraft: null,
+  _hrSamples: [], _powerSamples: [], _pauses: [], _pausedAtMs: null, _gapNext: false, _rejects: 0,
+  _lastEle: null, _eleRef: null, _prevSplitTimeS: 0, _splitStartEle: null,
+  _lapStart: { distanceM: 0, timeS: 0 },
+  _clientId: "", _lastPersistMs: 0,
+};
+
 export const useRecorder = create<RecorderState>((set, get) => ({
-  state: "idle",
+  ...idle,
   sport: "run",
-  points: [],
-  splits: [],
-  laps: [],
-  startDate: null,
-  elapsedMs: 0,
-  movingMs: 0,
-  distanceM: 0,
-  elevationM: 0,
-  currentSpeed: 0,
-  gpsStatus: "off",
-  gpsAccuracy: null,
   autoPause: true,
-  autoPaused: false,
-  lastSplitAt: 0,
-  finishedDraft: null,
   _timer: null,
   _watch: null,
   _wakeLock: null,
-  _hrSamples: [],
-
-  // called by the sensors store on every Bluetooth HR notification
-  noteHr: (hr) => {
-    const st = useRecorder.getState();
-    if (st.state === "idle" || st.state === "finished") return;
-    const t = Math.max(0, Math.round(((st.startDate ? Date.now() - st.startDate - st._pauseAccumMs : 0) / 1000) * 10) / 10);
-    const prev = st._hrSamples[st._hrSamples.length - 1];
-    if (prev && prev.t === t) {
-      // same tenth-second — keep the freshest reading
-      useRecorder.setState({ _hrSamples: [...st._hrSamples.slice(0, -1), { t, hr }] });
-      return;
-    }
-    useRecorder.setState({ _hrSamples: [...st._hrSamples, { t, hr }] });
-  },
-  _pauseAccumMs: 0,
   _lastTickMs: 0,
   _lastMoveAtMs: 0,
-  _eleHistory: [],
-  _prevSplitTimeS: 0,
+
+  // called by the sensors store on every Bluetooth notification
+  noteHr: (hr) => {
+    const st = get();
+    if (st.state !== "recording") return;
+    set({ _hrSamples: pushSample(st._hrSamples, elapsedS(st), hr) });
+  },
+  notePower: (watts) => {
+    const st = get();
+    if (st.state !== "recording") return;
+    set({ _powerSamples: pushSample(st._powerSamples, elapsedS(st), watts) });
+  },
 
   start: (sport, autoPause) => {
     stopInternal();
     const now = Date.now();
-    set({
-      state: "recording", sport, points: [], splits: [], laps: [],
-      startDate: now, elapsedMs: 0, movingMs: 0, distanceM: 0, elevationM: 0,
-      currentSpeed: 0, gpsStatus: "searching", gpsAccuracy: null,
-      autoPause, autoPaused: false,
-      _pauseAccumMs: 0, _lastMoveAtMs: now, _eleHistory: [], _prevSplitTimeS: 0, _hrSamples: [],
-    });
+    set({ ...idle, state: "recording", sport, startDate: now, gpsStatus: "searching", autoPause, _lastMoveAtMs: now, _clientId: newClientId() });
 
     const nav: any = navigator;
-    if (nav.wakeLock?.request) {
-      nav.wakeLock.request("screen").then((wl: any) => set({ _wakeLock: wl })).catch(() => {});
-      document.addEventListener("visibilitychange", onVisible);
-    }
+    nav.wakeLock?.request?.("screen").then((wl: any) => set({ _wakeLock: wl })).catch(() => {});
 
-    if (!navigator.geolocation) {
-      set({ gpsStatus: "off" });
-    } else {
-      const watch = navigator.geolocation.watchPosition(
-        (pos) => {
-          const st = get();
-          if (st.state === "idle") return;
-          const { latitude, longitude, altitude, accuracy } = pos.coords;
-          if (accuracy == null || accuracy > 50) {
-            set({ gpsStatus: st.points.length ? "weak" : "searching", gpsAccuracy: accuracy ? Math.round(accuracy) : null });
-            return;
-          }
-          const elapsedS = st.startDate ? (Date.now() - st.startDate - st._pauseAccumMs) / 1000 : 0;
-          const point: RecPoint = {
-            lng: longitude, lat: latitude,
-            ele: altitude != null && !isNaN(altitude) ? altitude : 0,
-            t: Math.max(0, Math.round(elapsedS * 10) / 10),
-          };
-          const prev = st.points[st.points.length - 1];
-          if (!prev) {
-            set({
-              points: [point],
-              gpsStatus: "ok",
-              gpsAccuracy: Math.round(accuracy),
-              _eleHistory: point.ele ? [point.ele] : [],
-              _lastMoveAtMs: Date.now(),
-            });
-            return;
-          }
-          const d = haversineM([prev.lng, prev.lat], [point.lng, point.lat]);
-          if (d <= 2 || d >= 80) {
-            // stationary jitter or GPS teleport — don't extend the track
-            set({ gpsStatus: "ok", gpsAccuracy: Math.round(accuracy) });
-            return;
-          }
-          const dt = Math.max(0.1, point.t - prev.t);
-          const speed = d / dt;
-          set((cur) => {
-            const points = [...cur.points, point];
-            const eleHistory = point.ele ? [...cur._eleHistory, point.ele] : cur._eleHistory;
-            const newDist = cur.distanceM + d;
-            // live km splits
-            const splits = [...cur.splits];
-            let prevSplitTimeS = cur._prevSplitTimeS;
-            let lastSplitAt = cur.lastSplitAt;
-            if (Math.floor(newDist / 1000) > Math.floor(cur.distanceM / 1000)) {
-              splits.push({
-                index: splits.length,
-                distanceM: 1000,
-                timeS: Math.round(cur.movingMs / 1000 - cur._prevSplitTimeS),
-                elevationDiff: Math.round(point.ele - (points[points.length - 2]?.ele ?? point.ele)),
-                paceZone: 0,
-              });
-              prevSplitTimeS = cur.movingMs / 1000;
-              lastSplitAt = Date.now();
-              if (navigator.vibrate) navigator.vibrate(60);
-            }
-            return {
-              points, eleHistory, splits,
-              distanceM: newDist,
-              currentSpeed: cur.currentSpeed * 0.7 + speed * 0.3,
-              gpsStatus: "ok",
-              gpsAccuracy: Math.round(accuracy),
-              _lastMoveAtMs: Date.now(),
-              _prevSplitTimeS: prevSplitTimeS,
-              lastSplitAt,
-            };
-          });
-        },
-        () => {
-          const st = get();
-          set({ gpsStatus: st.points.length ? "weak" : "off" });
-        },
-        { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 }
-      );
-      set({ _watch: watch });
-    }
+    startGps();
     startTicker();
   },
 
   pause: () => {
     const st = get();
     if (st.state !== "recording") return;
-    if (st._timer) clearInterval(st._timer);
-    set({ state: "paused", currentSpeed: 0, _timer: null, autoPaused: false });
+    set({ state: "paused", currentSpeed: 0, autoPaused: false, _pausedAtMs: Date.now() });
+    persistNow();
   },
 
   resume: () => {
     const st = get();
-    if (st.state !== "paused") return;
     const now = Date.now();
-    set({ state: "recording", _lastMoveAtMs: now, autoPaused: false });
-    startTicker();
+    if (st.state === "recording" && st.autoPaused) {
+      // manual override of an auto-pause
+      set({ autoPaused: false, _lastMoveAtMs: now });
+      return;
+    }
+    if (st.state !== "paused") return;
+    const from = elapsedS(st, st._pausedAtMs ?? now);
+    const to = elapsedS(st, now);
+    set({
+      state: "recording",
+      autoPaused: false,
+      _lastMoveAtMs: now,
+      _pausedAtMs: null,
+      _pauses: to > from ? [...st._pauses, [from, to]] : st._pauses,
+      _gapNext: true,
+    });
+    persistNow();
   },
 
   addLap: () => {
     const st = get();
-    if (st.state === "idle") return;
-    set({ laps: [...st.laps, { distanceM: st.distanceM, timeS: Math.round(st.movingMs / 1000) }] });
+    if (st.state === "idle" || st.state === "finished") return;
+    const timeS = Math.round(st.movingMs / 1000);
+    set({
+      laps: [...st.laps, { distanceM: st.distanceM - st._lapStart.distanceM, timeS: timeS - st._lapStart.timeS }],
+      _lapStart: { distanceM: st.distanceM, timeS },
+    });
+    persistNow();
   },
 
   setAutoPause: (v) => set({ autoPause: v }),
@@ -282,76 +401,54 @@ export const useRecorder = create<RecorderState>((set, get) => ({
     }
     stopInternal();
     set({ state: "finished", finishedDraft: draft, currentSpeed: 0 });
+    // kept on the phone until the upload succeeds (discard() clears it)
+    persistNow();
     return true;
   },
 
   buildDraft: () => {
     const st = get();
     if (!st.points.length) return null;
-    // precise splits recomputed from the track
-    const splits: RecSplit[] = [];
-    let acc = 0, idx = 0, splitStartEle = st.points[0].ele;
-    let lastSplitEndT = 0;
-    for (let i = 1; i < st.points.length; i++) {
-      const a = st.points[i - 1], b = st.points[i];
-      const d = haversineM([a.lng, a.lat], [b.lng, b.lat]);
-      const dt = b.t - a.t;
-      const v = dt > 0 ? d / dt : 0;
-      if (v > 0.55 && v < 25) acc += d;
-      if (acc >= (idx + 1) * 1000) {
-        splits.push({
-          index: idx, distanceM: 1000, timeS: Math.round(b.t - lastSplitEndT),
-          elevationDiff: Math.round(b.ele - splitStartEle), paceZone: 0,
-        });
-        lastSplitEndT = b.t;
-        splitStartEle = b.ele;
-        idx++;
-      }
-    }
-    const lastPartial = acc - idx * 1000;
-    if (lastPartial > 80) {
-      splits.push({
-        index: idx, distanceM: Math.round(lastPartial),
-        timeS: Math.round(st.movingMs / 1000 - lastSplitEndT),
-        elevationDiff: Math.round(st.points[st.points.length - 1].ele - splitStartEle), paceZone: 0,
-      });
-    }
-    if (splits.length > 2) {
-      const paces = splits.map((s) => s.timeS / Math.max(1, s.distanceM)).sort((a, b) => a - b);
-      const med = paces[Math.floor(paces.length / 2)];
-      for (const s of splits) {
-        s.paceZone = Math.max(-3, Math.min(3, Math.round(((med - s.timeS / Math.max(1, s.distanceM)) / med) * 10)));
-      }
-    }
-    // live heart-rate stats from a connected Bluetooth strap
-    const samples = st._hrSamples;
-    const avgHr = samples.length >= 8 ? Math.round(samples.reduce((a, b) => a + b.hr, 0) / samples.length) : null;
-    const maxHr = samples.length >= 8 ? Math.max(...samples.map((s) => s.hr)) : null;
-    const hrSeries = samples.length >= 8 ? samples.map((s) => [s.t, s.hr] as [number, number]) : null;
+    const now = Date.now();
+    const pauses: Pause[] = [...st._pauses];
+    if (st.state === "paused" && st._pausedAtMs != null) pauses.push([elapsedS(st, st._pausedAtMs), elapsedS(st, now)]);
+    const pts: TrackPoint[] = st.points;
+    // same motion model the server will apply, so the save screen matches the saved activity
+    const stats = pts.length > 1 ? trackStats(pts, pauses) : null;
+    const splits: RecSplit[] = computeSplits(pts, 1000, pauses).map(({ index, distanceM, timeS, elevationDiff, paceZone }) => ({
+      index, distanceM, timeS: Math.round(timeS), elevationDiff: Math.round(elevationDiff), paceZone,
+    }));
+    const movingTimeS = Math.round(st.movingMs / 1000);
+    // close the final lap so laps add up to the whole activity
+    const laps = st.laps.length
+      ? [...st.laps, { distanceM: st.distanceM - st._lapStart.distanceM, timeS: movingTimeS - st._lapStart.timeS }].filter((l) => l.timeS > 0)
+      : [];
+    const hr = seriesStats(st._hrSamples);
+    const power = seriesStats(st._powerSamples);
     return {
+      clientId: st._clientId,
       sport: st.sport,
-      points: st.points.map((p) => [p.lng, p.lat, p.ele, p.t]),
-      movingTimeS: Math.max(1, Math.round(st.movingMs / 1000)),
-      elapsedTimeS: Math.max(1, Math.round(st.elapsedMs / 1000)),
-      distanceM: st.distanceM,
-      elevationM: elevationGain(st._eleHistory.length ? st._eleHistory : st.points.map((p) => p.ele)),
+      points: pts.map((p) => [p.lng, p.lat, p.ele, p.t]),
+      pauses,
+      movingTimeS: Math.max(1, Math.round(stats?.movingS ?? movingTimeS)),
+      elapsedTimeS: Math.max(1, Math.round((now - (st.startDate ?? now)) / 1000)),
+      distanceM: stats?.distanceM ?? st.distanceM,
+      elevationM: stats?.elevationM ?? Math.round(st.elevationM),
       splits,
-      laps: st.laps,
-      startDate: new Date(st.startDate ?? Date.now()).toISOString(),
-      avgHr,
-      maxHr,
-      hrSeries,
+      laps,
+      startDate: new Date(st.startDate ?? now).toISOString(),
+      avgHr: hr.avg,
+      maxHr: hr.max,
+      hrSeries: hr.series,
+      avgWatts: power.avg,
+      maxWatts: power.max,
+      powerSeries: power.series,
     };
   },
 
   discard: () => {
     stopInternal();
-    set({
-      state: "idle", points: [], splits: [], laps: [], startDate: null,
-      elapsedMs: 0, movingMs: 0, distanceM: 0, elevationM: 0, currentSpeed: 0,
-      gpsStatus: "off", gpsAccuracy: null, autoPaused: false,
-      _pauseAccumMs: 0, _eleHistory: [], _prevSplitTimeS: 0, _timer: null, _watch: null, _hrSamples: [],
-      finishedDraft: null, lastSplitAt: 0,
-    });
+    set({ ...idle, _timer: null, _watch: null });
+    void clearRecording();
   },
 }));

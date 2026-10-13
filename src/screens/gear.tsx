@@ -132,6 +132,12 @@ export function GearScreen() {
                   >
                     {g.isDefault ? "Default" : "Make default"}
                   </button>
+                  <button
+                    onClick={async () => { await api.patch(`me/gear/${g.id}`, { retired: true }); qc.invalidateQueries({ queryKey: ["me", "gear"] }); }}
+                    className="px-2.5 h-8 rounded-md text-[11px] font-bold text-muted-foreground active:bg-muted"
+                  >
+                    Retire
+                  </button>
                   <AlertDialog>
                     <AlertDialogTrigger asChild>
                       <button className="w-8 h-8 rounded-md flex items-center justify-center text-muted-foreground active:bg-muted" aria-label="Delete gear"><Trash2 size={14} /></button>
@@ -139,7 +145,7 @@ export function GearScreen() {
                     <AlertDialogContent className="max-w-[320px]">
                       <AlertDialogHeader>
                         <AlertDialogTitle>Delete {g.name}?</AlertDialogTitle>
-                        <AlertDialogDescription>Activities already logged with this gear keep their history.</AlertDialogDescription>
+                        <AlertDialogDescription>Your activities stay, but lose this gear tag and its mileage. To keep the history, retire it instead.</AlertDialogDescription>
                       </AlertDialogHeader>
                       <AlertDialogFooter>
                         <AlertDialogCancel>Cancel</AlertDialogCancel>

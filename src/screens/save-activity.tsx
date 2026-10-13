@@ -3,7 +3,7 @@ import React, { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2, Check } from "lucide-react";
 import { api } from "@/lib/api";
-import { useNav } from "@/lib/nav";
+import { useNav, useUI } from "@/lib/nav";
 import { useRecorder } from "@/lib/recorder";
 import { useSensors } from "@/lib/sensors";
 import { ScreenHeader } from "@/components/app/shell";
@@ -39,12 +39,15 @@ export function SaveActivityScreen() {
   const units = useUnits();
   const { toast } = useToast();
   const hrm = useSensors((s) => s.hrm);
+  const pm = useSensors((s) => s.pm);
   const draft = rec.finishedDraft;
   const def = sportOf(draft?.sport ?? "run");
   const [sport, setSport] = useState(draft?.sport ?? "run");
   const [title, setTitle] = useState(`${defaultTitle()} ${def.label}`);
   const [description, setDescription] = useState("");
-  const [visibility, setVisibility] = useState("everyone");
+  // start from the athlete's chosen default, never silently public
+  const defaultVisibility = useUI((s) => s.me?.defaultVisibility) ?? "everyone";
+  const [visibility, setVisibility] = useState(defaultVisibility);
   const [gearId, setGearId] = useState<string | null>(null);
   const [isCommute, setIsCommute] = useState(false);
   const [perceived, setPerceived] = useState<number | null>(null);
@@ -54,11 +57,13 @@ export function SaveActivityScreen() {
   const saveMut = useMutation({
     mutationFn: () =>
       api.post<{ activity: { id: string } }>("activities", {
+        clientId: draft?.clientId,
         sport,
         title: title.trim() || null,
         description: description.trim() || null,
         startDate: draft?.startDate,
         track: draft?.points,
+        pauses: draft?.pauses ?? null,
         movingTimeS: draft?.movingTimeS,
         elapsedTimeS: draft?.elapsedTimeS,
         distanceM: draft?.distanceM,
@@ -73,7 +78,8 @@ export function SaveActivityScreen() {
         avgHr: draft?.avgHr ?? null,
         maxHr: draft?.maxHr ?? null,
         hrSeries: draft?.hrSeries ?? null,
-        deviceName: draft?.hrSeries ? `STRIDE App${hrm.name ? ` + ${hrm.name}` : " + HR strap"}` : "STRIDE App",
+        powerSeries: draft?.powerSeries ?? null,
+        deviceName: ["STRIDE App", draft?.hrSeries && (hrm.name ?? "HR strap"), draft?.powerSeries && (pm.name ?? "power meter")].filter(Boolean).join(" + "),
       }),
     onSuccess: async (res) => {
       rec.discard();
@@ -84,7 +90,11 @@ export function SaveActivityScreen() {
       nav.reset("home", { k: "feed" });
       nav.push({ k: "activity", id: res.activity.id });
     },
-    onError: (e: any) => toast({ description: e.message ?? "Could not save activity" }),
+    // network blips: try again a couple of times; the clientId stops duplicates
+    retry: (n, e: any) => n < 2 && !/^(Sign in|Track|Invalid|Unknown)/.test(e?.message ?? ""),
+    retryDelay: (n) => 1500 * 2 ** n,
+    onError: (e: any) =>
+      toast({ description: `${e.message ?? "Could not upload"}. Your activity is safe on this phone — tap Save to try again.` }),
   });
 
   if (!draft) {

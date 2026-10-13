@@ -43,8 +43,11 @@ export interface ActivityCard {
   maxSpeed: number | null;
   avgHr: number | null;
   maxHr: number | null;
+  avgWatts?: number | null;
+  maxWatts?: number | null;
   calories: number | null;
   relativeEffort: number | null;
+  effortSource: string | null;
   perceivedEffort: number | null;
   visibility: string;
   isCommute: boolean;
@@ -99,6 +102,7 @@ export async function activityCard(
   if (commentCount === undefined) commentCount = act.commentCount;
   let athlete = act.athlete;
   if (!athlete) athlete = await db.athlete.findUnique({ where: { id: act.athleteId } });
+  const isOwner = viewerId === act.athleteId;
 
   let polyline: [number, number][] | null = null;
   if (opts.poly !== false && act.track && !act.isTrainer) {
@@ -119,12 +123,11 @@ export async function activityCard(
   }
 
   let hasKudos = false;
-  if (viewerId && (act.kudos as any[] | undefined)?.length >= 0 && Array.isArray(act.kudos)) {
-    hasKudos = act.kudos.some((k: any) => k.athleteId === viewerId);
-  } else if (viewerId) {
-    hasKudos = !!(await db.kudos.findUnique({
-      where: { activityId_athleteId: { activityId: act.id, athleteId: viewerId } },
-    }));
+  if (viewerId) {
+    // callers usually include the viewer's kudos; otherwise look it up
+    hasKudos = Array.isArray(act.kudos)
+      ? act.kudos.some((k: any) => k.athleteId === viewerId)
+      : !!(await db.kudos.findFirst({ where: { activityId: act.id, athleteId: viewerId } }));
   }
 
   const achievementCount = (act as any)._count?.efforts ?? 0;
@@ -144,8 +147,11 @@ export async function activityCard(
     maxSpeed: act.maxSpeed,
     avgHr: act.avgHr,
     maxHr: act.maxHr,
+    avgWatts: act.avgWatts ?? null,
+    maxWatts: act.maxWatts ?? null,
     calories: act.calories,
     relativeEffort: act.relativeEffort,
+    effortSource: act.effortSource ?? null,
     perceivedEffort: act.perceivedEffort,
     visibility: act.visibility,
     isCommute: act.isCommute,
@@ -155,8 +161,9 @@ export async function activityCard(
     flagged: act.flagged,
     gear: act.gear ? { id: act.gear.id, name: act.gear.name, type: act.gear.type } : null,
     polyline,
-    startLat: act.startLat,
-    startLng: act.startLng,
+    // the exact start point is the owner's alone (it is often their front door)
+    startLat: isOwner ? act.startLat : null,
+    startLng: isOwner ? act.startLng : null,
     kudosCount: kudosCount ?? 0,
     commentCount: commentCount ?? 0,
     hasKudos,
