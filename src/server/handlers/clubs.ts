@@ -2,6 +2,38 @@ import { db } from "@/lib/db";
 import { json, err } from "../session";
 import { activityCard } from "../transform";
 import { startOfWeek } from "../analytics";
+import { followingIdsOf, visibleTo } from "../visibility";
+import type { Prisma } from "@prisma/client";
+
+const ORGANISER_ROLES = ["owner", "admin"];
+
+function clubWhere(idOrSlug: string) {
+  return { OR: [{ slug: idOrSlug }, { id: idOrSlug }] };
+}
+
+// recount instead of nudging, so concurrent joins can't make the number drift
+async function recountMembers(tx: Prisma.TransactionClient, clubId: string) {
+  await tx.club.update({ where: { id: clubId }, data: { memberCount: await tx.clubMembership.count({ where: { clubId } }) } });
+}
+
+// When an owner leaves (or deletes their account) the longest-standing admin,
+// or failing that member, becomes owner; a club left with nobody is removed.
+export async function handOverClubs(tx: Prisma.TransactionClient, athleteId: string, clubIds?: string[]) {
+  const owned = await tx.clubMembership.findMany({
+    where: { athleteId, role: "owner", ...(clubIds ? { clubId: { in: clubIds } } : {}) },
+    select: { clubId: true },
+  });
+  for (const { clubId } of owned) {
+    const others = await tx.clubMembership.findMany({
+      where: { clubId, athleteId: { not: athleteId } },
+      orderBy: { joinedAt: "asc" },
+    });
+    if (others.some((m) => m.role === "owner")) continue;
+    const heir = others.find((m) => m.role === "admin") ?? others[0];
+    if (heir) await tx.clubMembership.update({ where: { id: heir.id }, data: { role: "owner" } });
+    else await tx.club.delete({ where: { id: clubId } });
+  }
+}
 
 // GET /api/clubs?mine=1 | discover
 export async function listClubs(viewerId: string | null, url: URL): Promise<Response> {
@@ -48,7 +80,7 @@ export async function createClub(viewerId: string | null, body: any): Promise<Re
       slug: name.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40) + "-" + Math.random().toString(36).slice(2, 6),
       name, description: body?.description ? String(body.description).slice(0, 500) : null,
       sport, city: String(body?.city ?? "").trim() || "—", country: String(body?.country ?? "").trim() || "—",
-      coverColor: body?.coverColor ?? "#fc4c02", memberCount: 1, privacy: "public",
+      coverColor: /^#[0-9a-fA-F]{6}$/.test(body?.coverColor ?? "") ? body.coverColor : "#fc4c02", memberCount: 1, privacy: "public",
       memberships: { create: { athleteId: viewerId, role: "owner" } },
     },
   });
@@ -57,7 +89,7 @@ export async function createClub(viewerId: string | null, body: any): Promise<Re
 
 // GET /api/clubs/:slugOrId
 export async function getClub(idOrSlug: string, viewerId: string | null): Promise<Response> {
-  const club = await db.club.findFirst({ where: { OR: [{ slug: idOrSlug }, { id: idOrSlug }] } as any });
+  const club = await db.club.findFirst({ where: clubWhere(idOrSlug) });
   if (!club) return err(404, "Club not found");
   const memberships = await db.clubMembership.findMany({
     where: { clubId: club.id },
@@ -66,12 +98,14 @@ export async function getClub(idOrSlug: string, viewerId: string | null): Promis
   });
   const memberIds = memberships.map((m) => m.athleteId);
   const myMembership = viewerId ? memberships.find((m) => m.athleteId === viewerId) : null;
+  // the leaderboard and feed show only activities this viewer may see
+  const visible = visibleTo(viewerId, await followingIdsOf(viewerId));
 
   // weekly distance leaderboard among members
   const weekStart = startOfWeek();
   const weekActs = await db.activity.groupBy({
     by: ["athleteId"],
-    where: { athleteId: { in: memberIds }, startDate: { gte: weekStart } },
+    where: { athleteId: { in: memberIds }, startDate: { gte: weekStart }, ...visible },
     _sum: { distanceM: true, movingTimeS: true },
     _count: true,
   });
@@ -93,7 +127,7 @@ export async function getClub(idOrSlug: string, viewerId: string | null): Promis
 
   // club feed: recent member activities
   const feedActs = await db.activity.findMany({
-    where: { athleteId: { in: memberIds }, visibility: { in: ["everyone", "followers"] } },
+    where: { athleteId: { in: memberIds }, ...visible },
     include: {
       athlete: true, track: true, gear: true,
       kudos: viewerId ? { where: { athleteId: viewerId } } : false,
@@ -129,27 +163,36 @@ export async function getClub(idOrSlug: string, viewerId: string | null): Promis
 // POST /api/clubs/:id/join | /leave
 export async function joinClub(idOrSlug: string, viewerId: string | null, body: any): Promise<Response> {
   if (!viewerId) return err(401, "Sign in required");
-  const club = await db.club.findFirst({ where: { OR: [{ slug: idOrSlug }, { id: idOrSlug }] } as any });
+  const club = await db.club.findFirst({ where: clubWhere(idOrSlug) });
   if (!club) return err(404, "Club not found");
-  const existing = await db.clubMembership.findUnique({
-    where: { clubId_athleteId: { clubId: club.id, athleteId: viewerId } },
-  });
-  const leaving = existing && body?.action !== "join";
-  if (leaving) {
-    await db.clubMembership.delete({ where: { id: existing.id } });
-    await db.club.update({ where: { id: club.id }, data: { memberCount: { decrement: 1 } } });
+  const key = { clubId: club.id, athleteId: viewerId };
+  // explicit action is safe to repeat; without one the call toggles
+  const join = body?.action === "join" ? true : body?.action === "leave" ? false
+    : !(await db.clubMembership.findUnique({ where: { clubId_athleteId: key } }));
+
+  if (!join) {
+    await db.$transaction(async (tx) => {
+      await handOverClubs(tx, viewerId, [club.id]);
+      await tx.clubMembership.deleteMany({ where: key });
+      if (await tx.club.findUnique({ where: { id: club.id }, select: { id: true } })) await recountMembers(tx, club.id);
+    });
     return json({ isMember: false });
   }
-  if (!existing) {
-    await db.clubMembership.create({ data: { clubId: club.id, athleteId: viewerId } });
-    await db.club.update({ where: { id: club.id }, data: { memberCount: { increment: 1 } } });
-    for (const admin of await db.clubMembership.findMany({ where: { clubId: club.id, role: "owner" }, select: { athleteId: true } })) {
-      if (admin.athleteId !== viewerId) {
-        await db.notification.create({
-          data: { recipientId: admin.athleteId, actorId: viewerId, type: "club_join", clubId: club.id, text: `${(await db.athlete.findUnique({ where: { id: viewerId } }))?.firstName} joined ${club.name}` },
-        });
-      }
-    }
+  const joined = await db.$transaction(async (tx) => {
+    const { count } = await tx.clubMembership.createMany({ data: [key], skipDuplicates: true });
+    await recountMembers(tx, club.id);
+    return count > 0;
+  });
+  if (joined) {
+    const [me, organisers] = await Promise.all([
+      db.athlete.findUnique({ where: { id: viewerId }, select: { firstName: true } }),
+      db.clubMembership.findMany({ where: { clubId: club.id, role: "owner" }, select: { athleteId: true } }),
+    ]);
+    await db.notification.createMany({
+      data: organisers
+        .filter((o) => o.athleteId !== viewerId)
+        .map((o) => ({ recipientId: o.athleteId, actorId: viewerId, type: "club_join", clubId: club.id, text: `${me?.firstName ?? "Someone"} joined ${club.name}` })),
+    });
   }
   return json({ isMember: true });
 }
@@ -157,16 +200,23 @@ export async function joinClub(idOrSlug: string, viewerId: string | null, body: 
 // POST /api/clubs/:id/events — create event (owner/admin)
 export async function createEvent(idOrSlug: string, viewerId: string | null, body: any): Promise<Response> {
   if (!viewerId) return err(401, "Sign in required");
-  const club = await db.club.findFirst({ where: { OR: [{ slug: idOrSlug }, { id: idOrSlug }] } as any });
+  const club = await db.club.findFirst({ where: clubWhere(idOrSlug) });
   if (!club) return err(404, "Club not found");
-  const title = String(body?.title ?? "").trim();
+  const membership = await db.clubMembership.findUnique({ where: { clubId_athleteId: { clubId: club.id, athleteId: viewerId } } });
+  if (!membership || !ORGANISER_ROLES.includes(membership.role)) return err(403, "Only the club's owner and admins can create events");
+  const title = String(body?.title ?? "").trim().slice(0, 120);
   if (!title) return err(400, "Event title required");
+  const startDate = body?.startDate ? new Date(body.startDate) : new Date(Date.now() + 86400000);
+  if (Number.isNaN(startDate.getTime())) return err(400, "Invalid start date");
+  const durationMin = Math.round(Number(body?.durationMin ?? 90));
   const event = await db.clubEvent.create({
     data: {
       clubId: club.id, title, description: body?.description ? String(body.description).slice(0, 800) : null,
-      startDate: body?.startDate ? new Date(body.startDate) : new Date(Date.now() + 86400000),
-      durationMin: Number(body?.durationMin ?? 90), meetingSpot: body?.meetingSpot ? String(body.meetingSpot) : null,
-      sport: String(body?.sport ?? club.sport === "cycling" ? "ride" : "run"), goingCount: 1,
+      startDate,
+      durationMin: Number.isFinite(durationMin) && durationMin > 0 && durationMin <= 24 * 60 ? durationMin : 90,
+      meetingSpot: body?.meetingSpot ? String(body.meetingSpot).slice(0, 200) : null,
+      sport: ["ride", "run", "walk", "hike", "swim"].includes(body?.sport) ? body.sport : club.sport === "cycling" ? "ride" : "run",
+      goingCount: 1,
       attendances: { create: { athleteId: viewerId, status: "going" } },
     },
   });
@@ -176,24 +226,15 @@ export async function createEvent(idOrSlug: string, viewerId: string | null, bod
 // POST /api/clubs/:id/events/:eventId/rsvp
 export async function rsvp(idOrSlug: string, eventId: string, viewerId: string | null, body: any): Promise<Response> {
   if (!viewerId) return err(401, "Sign in required");
-  const event = await db.clubEvent.findUnique({ where: { id: eventId } });
+  const club = await db.club.findFirst({ where: clubWhere(idOrSlug), select: { id: true } });
+  const event = club ? await db.clubEvent.findFirst({ where: { id: eventId, clubId: club.id } }) : null;
   if (!event) return err(404, "Event not found");
   const status = body?.status === "interested" ? "interested" : body?.status === "none" ? "none" : "going";
-  const existing = await db.eventAttendance.findUnique({
-    where: { eventId_athleteId: { eventId, athleteId: viewerId } },
+  const key = { eventId, athleteId: viewerId };
+  await db.$transaction(async (tx) => {
+    if (status === "none") await tx.eventAttendance.deleteMany({ where: key });
+    else await tx.eventAttendance.upsert({ where: { eventId_athleteId: key }, create: { ...key, status }, update: { status } });
+    await tx.clubEvent.update({ where: { id: eventId }, data: { goingCount: await tx.eventAttendance.count({ where: { eventId, status: "going" } }) } });
   });
-  if (status === "none") {
-    if (existing) {
-      await db.eventAttendance.delete({ where: { id: existing.id } });
-      await db.clubEvent.update({ where: { id: eventId }, data: { goingCount: { decrement: 1 } } });
-    }
-    return json({ myStatus: null });
-  }
-  if (!existing) {
-    await db.eventAttendance.create({ data: { eventId, athleteId: viewerId, status } });
-    await db.clubEvent.update({ where: { id: eventId }, data: { goingCount: { increment: 1 } } });
-  } else if (existing.status !== status) {
-    await db.eventAttendance.update({ where: { id: existing.id }, data: { status } });
-  }
-  return json({ myStatus: status });
+  return json({ myStatus: status === "none" ? null : status });
 }

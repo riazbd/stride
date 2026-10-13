@@ -14,7 +14,7 @@ export function FitnessScreen({ id }: { id: string }) {
   const premium = usePremium();
   const { data } = useQuery({
     queryKey: ["fitness", id],
-    queryFn: () => api.get<{ series: FitnessPoint[]; current: FitnessPoint | null }>(`athletes/${id}/fitness`),
+    queryFn: () => api.get<{ series: FitnessPoint[]; current: FitnessPoint | null; measuredShare: number }>(`athletes/${id}/fitness`),
     enabled: !!id,
   });
 
@@ -61,6 +61,12 @@ export function FitnessScreen({ id }: { id: string }) {
             </span>
           </div>
           <FitnessChart series={series} height={180} />
+          {data.measuredShare < 0.5 && (
+            <p className="text-[11.5px] text-muted-foreground leading-snug mt-2">
+              Most of these activities had no heart-rate sensor, so their load comes from your effort rating or an
+              estimate for the sport. Rate each activity, or wear a strap, to make this more accurate.
+            </p>
+          )}
           <ChartLegend
             items={[
               { color: "var(--foreground)", label: "Fitness (CTL)" },

@@ -114,8 +114,8 @@ export function MapView({
       cancelled = true;
       mapRef.current?.remove();
       mapRef.current = null;
-      lineLayers.current = {};
-      markerLayers.current = {};
+      lineLayers.current = new Map();
+      markerLayers.current = new Map();
     };
      
   }, []);
@@ -158,12 +158,12 @@ export function MapView({
     for (const line of lines ?? []) {
       wanted.add(line.id);
       const latlngs = line.coordinates.map(([lng, lat]) => [lat, lng] as [number, number]);
-      let existing = lineLayers.current.get(line.id);
+      const existing = lineLayers.current.get(line.id);
       if (existing) {
         existing.setLatLngs(latlngs);
         existing.setStyle({ color: line.color ?? "#fc4c02", weight: line.width ?? 4, opacity: 1 });
       } else {
-        existing = L.polyline(latlngs, {
+        const created: L.Polyline = L.polyline(latlngs, {
           color: line.color ?? "#fc4c02",
           weight: line.width ?? 4,
           opacity: 1,
@@ -172,7 +172,7 @@ export function MapView({
           dashArray: line.dashed ? "6 6" : undefined,
           interactive: false,
         }).addTo(map);
-        lineLayers.current.set(line.id, existing);
+        lineLayers.current.set(line.id, created);
       }
     }
     for (const [id, layer] of lineLayers.current) {

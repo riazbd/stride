@@ -2,6 +2,7 @@ import { db } from "@/lib/db";
 import { json, err } from "../session";
 import { athleteSummary } from "../transform";
 import { pathLength } from "@/lib/geo";
+import { hasFullAccess } from "../entitlement";
 
 // GET /api/search?q=
 export async function search(viewerId: string | null, url: URL): Promise<Response> {
@@ -9,11 +10,11 @@ export async function search(viewerId: string | null, url: URL): Promise<Respons
   if (q.length < 2) return json({ q, athletes: [], clubs: [], segments: [] });
   const [athletes, clubs, segments] = await Promise.all([
     db.athlete.findMany({
-      where: { OR: [{ firstName: { contains: q } }, { lastName: { contains: q } }, { city: { contains: q } }] },
+      where: { OR: [{ firstName: { contains: q, mode: "insensitive" as const } }, { lastName: { contains: q, mode: "insensitive" as const } }, { city: { contains: q, mode: "insensitive" as const } }] },
       take: 12,
     }),
-    db.club.findMany({ where: { OR: [{ name: { contains: q } }, { city: { contains: q } }] }, take: 8 }),
-    db.segment.findMany({ where: { OR: [{ name: { contains: q } }, { city: { contains: q } }] }, take: 10 }),
+    db.club.findMany({ where: { OR: [{ name: { contains: q, mode: "insensitive" as const } }, { city: { contains: q, mode: "insensitive" as const } }] }, take: 8 }),
+    db.segment.findMany({ where: { OR: [{ name: { contains: q, mode: "insensitive" as const } }, { city: { contains: q, mode: "insensitive" as const } }] }, take: 10 }),
   ]);
   const myFollowing = viewerId
     ? new Set((await db.athleteFollow.findMany({ where: { followerId: viewerId }, select: { followedId: true } })).map((r) => r.followedId))
@@ -50,8 +51,13 @@ export async function createRoute(viewerId: string | null, body: any): Promise<R
   const name = String(body?.name ?? "").trim();
   const points = body?.points;
   if (!name) return err(400, "Route name required");
-  if (!Array.isArray(points) || points.length < 2) return err(400, "Route points required");
+  if (!Array.isArray(points) || points.length < 2 || points.length > 20000) return err(400, "Route points required");
+  const me = await db.athlete.findUnique({ where: { id: viewerId }, select: { premium: true } });
+  if (!hasFullAccess(me)) return err(402, "The route builder is a Premium feature");
   const pts = points.map((p: any) => [Number(p[0]), Number(p[1]), Number(p[2] ?? 0)]);
+  if (pts.some((p: number[]) => !Number.isFinite(p[0]) || !Number.isFinite(p[1]) || Math.abs(p[0]) > 180 || Math.abs(p[1]) > 90)) {
+    return err(400, "Invalid route point");
+  }
   const distanceM = pathLength(pts.map((p) => [p[0], p[1]] as [number, number]));
   const route = await db.route.create({
     data: {

@@ -2,7 +2,7 @@
 import React, { useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { FileUp, Loader2, MapPin, Mountain, Route as RouteIcon, Timer, Upload, TriangleAlert, Check } from "lucide-react";
-import { useNav } from "@/lib/nav";
+import { useNav, useUI } from "@/lib/nav";
 import { useToast } from "@/hooks/use-toast";
 import { ScreenHeader } from "@/components/app/shell";
 import { SportIcon } from "@/components/app/ui";
@@ -10,7 +10,8 @@ import { Input } from "@/components/ui/input";
 import { api } from "@/lib/api";
 import { parseGpx, type GpxImport } from "@/lib/gpx";
 import { sportOf } from "@/lib/sports";
-import { fmtDuration } from "@/lib/format";
+import { fmtDist, distUnit, fmtDuration, fmtElev } from "@/lib/format";
+import { useUnits } from "@/components/app/cards";
 import { cn } from "@/lib/utils";
 
 const IMPORT_SPORTS = ["run", "trail_run", "ride", "gravel", "mtb", "walk", "hike", "swim", "row", "workout", "yoga", "ski"];
@@ -25,6 +26,7 @@ export function ImportGpxScreen() {
   const nav = useNav();
   const qc = useQueryClient();
   const { toast } = useToast();
+  const units = useUnits();
   const fileRef = useRef<HTMLInputElement>(null);
   const [gpx, setGpx] = useState<GpxImport | null>(null);
   const [fileName, setFileName] = useState("");
@@ -32,7 +34,9 @@ export function ImportGpxScreen() {
   const [reading, setReading] = useState(false);
   const [sport, setSport] = useState("run");
   const [title, setTitle] = useState("");
-  const [visibility, setVisibility] = useState("everyone");
+  // start from the athlete's chosen default, never silently public
+  const defaultVisibility = useUI((s) => s.me?.defaultVisibility) ?? "everyone";
+  const [visibility, setVisibility] = useState(defaultVisibility);
   const [saving, setSaving] = useState(false);
 
   const pick = () => fileRef.current?.click();
@@ -51,7 +55,9 @@ export function ImportGpxScreen() {
       setGpx(parsed);
       setFileName(f.name);
       setTitle(parsed.name ?? f.name.replace(/\.gpx$/i, "").replace(/[-_]/g, " "));
-      setSport(/ride|bik|cycl/i.test(parsed.name ?? "") ? "ride" : /hike/i.test(parsed.name ?? "") ? "hike" : "run");
+      // the file's own <type> wins (STRIDE/Strava/Garmin all write one), else guess from the name
+      const hint = `${parsed.type ?? ""} ${parsed.name ?? ""}`;
+      setSport(/ride|bik|cycl/i.test(hint) ? "ride" : /hik/i.test(hint) ? "hike" : /walk/i.test(hint) ? "walk" : "run");
     } catch (e: any) {
       setGpx(null);
       setError(e?.message ?? "Could not read this GPX file.");
@@ -70,6 +76,10 @@ export function ImportGpxScreen() {
         startDate: new Date(gpx.startMs).toISOString(),
         tzOffsetMin: -new Date(gpx.startMs).getTimezoneOffset(),
         track: gpx.points.map((p) => [p.lng, p.lat, p.ele, p.t]),
+        pauses: gpx.pauses,
+        elapsedTimeS: gpx.durationS,
+        hrSeries: gpx.hrSeries,
+        powerSeries: gpx.powerSeries,
         visibility,
         deviceName: "GPX import",
       });
@@ -140,6 +150,7 @@ export function ImportGpxScreen() {
                 <div className="text-[13.5px] font-bold truncate">{fileName}</div>
                 <div className="text-[11.5px] text-muted-foreground">
                   {gpx.rawCount.toLocaleString()} GPS points{gpx.rawCount > gpx.points.length ? ` (sampled to ${gpx.points.length})` : ""}
+                  {gpx.hrSeries ? " · heart rate" : ""}{gpx.powerSeries ? " · power" : ""}
                 </div>
               </div>
               <button
@@ -151,9 +162,9 @@ export function ImportGpxScreen() {
             </div>
             <div className="grid grid-cols-4 gap-2 pt-3">
               {[
-                { icon: RouteIcon, v: `${(gpx.distanceM / 1000).toFixed(2)} km`, l: "Distance" },
-                { icon: Timer, v: fmtDuration(gpx.durationS), l: "Time" },
-                { icon: Mountain, v: `${gpx.eleGainM} m`, l: "Elev gain" },
+                { icon: RouteIcon, v: `${fmtDist(gpx.distanceM, units, 2)} ${distUnit(units)}`, l: "Distance" },
+                { icon: Timer, v: fmtDuration(gpx.movingS), l: "Moving" },
+                { icon: Mountain, v: fmtElev(gpx.eleGainM, units), l: "Elev gain" },
                 { icon: MapPin, v: new Date(gpx.startMs).toLocaleDateString(undefined, { month: "short", day: "numeric" }), l: "Date" },
               ].map((s) => (
                 <div key={s.l} className="flex flex-col items-center gap-0.5">

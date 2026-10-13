@@ -62,7 +62,6 @@ server.log
 /tool-results/
 /.zscripts/
 /mini-services/
-/tests/
 /examples/
 /agent-ctx/
 worklog.md
@@ -75,3 +74,5 @@ scripts/vlm_*.json
 scripts/*.png
 scripts/check_*.js
 scripts/cleanup_*.js
+# project-local PostgreSQL cluster (bun run pg:start)
+/.pgdata/

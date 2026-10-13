@@ -96,6 +96,147 @@ export function simplifyTrack(pts: TrackPoint[], toleranceM: number): TrackPoint
   return [...keep].sort((x, y) => x - y).map((i) => pts[i]);
 }
 
+// ── Motion model ─────────────────────────────────────────────────────────────
+// Raw GPS lies in two ways that inflate stats if every hop is trusted:
+//  • a phone standing still reports fixes a few metres apart every second,
+//    which hop-by-hop looks like a slow walk;
+//  • noise while moving zig-zags the line, adding distance (badly at walking pace).
+// So: teleport fixes are interpolated away, positions are smoothed over a
+// speed-adaptive window (~6 m of travel), and a hop only counts as moving when
+// the *net* displacement across ±8 s clears SPEED_EPS — wander goes nowhere,
+// real motion does. Nothing is smoothed or windowed across a manual pause.
+// Trade-off: the window can't pinpoint the instant you stopped, so roughly the
+// first and last 5–7 s of each stop still count as moving. Narrower windows fix
+// that but start mistaking heavy GPS wander for motion.
+
+/** [tStart, tEnd] in track seconds while the recorder was manually paused. */
+export type Pause = [number, number];
+
+export const SPEED_EPS = 0.55; // m/s — net speed below this means stopped
+const TELEPORT_SPEED = 50; // m/s — faster than any human-powered sport
+const STOP_WINDOW_S = 8; // half-width of the moving/stopped window
+const STOP_REACH_M = 12; // GPS wander while stopped stays well inside this
+const SMOOTH_DIST_M = 6; // smoothing window covers about this much travel
+const SMOOTH_MIN_S = 1;
+const SMOOTH_MAX_S = 5;
+const MAX_SPEED_WINDOW_S = 5;
+
+export interface Hop {
+  d: number; // metres (smoothed)
+  dt: number; // seconds
+  moving: boolean;
+}
+
+function spansPause(t0: number, t1: number, pauses?: Pause[] | null): boolean {
+  if (!pauses) return false;
+  for (const [a, b] of pauses) if (a < t1 && b > t0) return true;
+  return false;
+}
+
+/** One hop per consecutive point pair: hops[i - 1] joins pts[i - 1] → pts[i]. */
+export function motionHops(pts: TrackPoint[], pauses?: Pause[] | null): Hop[] {
+  const n = pts.length;
+  if (n < 2) return [];
+  // contiguous runs between pauses
+  const runStart = new Array<number>(n).fill(0);
+  const runEnd = new Array<number>(n).fill(n - 1);
+  const broken = new Array<boolean>(n).fill(false); // hop (i-1 → i) spans a pause
+  for (let i = 1; i < n; i++) {
+    broken[i] = spansPause(pts[i - 1].t, pts[i].t, pauses);
+    runStart[i] = broken[i] ? i : runStart[i - 1];
+  }
+  for (let i = n - 2; i >= 0; i--) runEnd[i] = broken[i + 1] ? i : runEnd[i + 1];
+
+  // 1) teleports: a fix that implies an impossible speed from the last good fix
+  //    is replaced by interpolation; 5 in a row means the old anchor was the bad one
+  const lng = pts.map((p) => p.lng);
+  const lat = pts.map((p) => p.lat);
+  const bad = new Array<boolean>(n).fill(false);
+  let good = 0;
+  let streak = 0;
+  for (let i = 1; i < n; i++) {
+    if (runStart[i] === i) { good = i; streak = 0; continue; }
+    const v = haversineM([lng[good], lat[good]], [lng[i], lat[i]]) / Math.max(1, pts[i].t - pts[good].t);
+    if (v > TELEPORT_SPEED && streak < 5) { bad[i] = true; streak++; }
+    else { good = i; streak = 0; }
+  }
+  for (let i = 0; i < n; i++) {
+    if (!bad[i]) continue;
+    let a = i - 1; while (a >= runStart[i] && bad[a]) a--;
+    let b = i + 1; while (b <= runEnd[i] && bad[b]) b++;
+    if (a < runStart[i] && b > runEnd[i]) continue;
+    if (a < runStart[i]) { lng[i] = lng[b]; lat[i] = lat[b]; continue; }
+    if (b > runEnd[i]) { lng[i] = lng[a]; lat[i] = lat[a]; continue; }
+    const f = pts[b].t > pts[a].t ? (pts[i].t - pts[a].t) / (pts[b].t - pts[a].t) : 0;
+    lng[i] = lng[a] + f * (lng[b] - lng[a]);
+    lat[i] = lat[a] + f * (lat[b] - lat[a]);
+  }
+
+  // 2) speed-adaptive centred moving average (prefix sums + binary search)
+  const cx = new Float64Array(n + 1);
+  const cy = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) { cx[i + 1] = cx[i] + lng[i]; cy[i + 1] = cy[i] + lat[i]; }
+  const lowerT = (t: number, lo: number, hi: number) => { // first index in [lo, hi] with time ≥ t
+    hi++;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (pts[m].t < t) lo = m + 1; else hi = m; }
+    return lo;
+  };
+  const upperT = (t: number, lo: number, hi: number) => { // last index in [lo, hi] with time ≤ t
+    hi++;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (pts[m].t <= t) lo = m + 1; else hi = m; }
+    return lo - 1;
+  };
+  const sx = new Float64Array(n);
+  const sy = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const r0 = runStart[i], r1 = runEnd[i];
+    let a = lowerT(pts[i].t - 4, r0, r1), b = upperT(pts[i].t + 4, r0, r1);
+    if (a === b) { a = Math.max(r0, i - 1); b = Math.min(r1, i + 1); } // sparse samples
+    const span = pts[b].t - pts[a].t;
+    // path speed, not net: net reads ~0 at a hairpin and the widened
+    // window would then drag the apex inwards
+    let path = 0;
+    for (let k = a + 1; k <= b; k++) path += haversineM([lng[k - 1], lat[k - 1]], [lng[k], lat[k]]);
+    const v = span > 0 ? path / span : 0;
+    // symmetric window, shrunk near run ends so endpoints stay put
+    const s = Math.min(
+      v > 0 ? Math.max(SMOOTH_MIN_S, Math.min(SMOOTH_MAX_S, SMOOTH_DIST_M / v)) : SMOOTH_MAX_S,
+      pts[i].t - pts[r0].t,
+      pts[r1].t - pts[i].t,
+    );
+    const lo = lowerT(pts[i].t - s, r0, r1);
+    const hi = upperT(pts[i].t + s, r0, r1);
+    const c = hi - lo + 1;
+    sx[i] = (cx[hi + 1] - cx[lo]) / c;
+    sy[i] = (cy[hi + 1] - cy[lo]) / c;
+  }
+
+  // 3) moving = net displacement across a ±STOP_WINDOW_S window around the hop
+  const hops: Hop[] = [];
+  let a = 0;
+  let b = 0;
+  for (let i = 1; i < n; i++) {
+    const dt = pts[i].t - pts[i - 1].t;
+    const d = haversineM([sx[i - 1], sy[i - 1]], [sx[i], sy[i]]);
+    if (broken[i] || dt <= 0) {
+      hops.push({ d: broken[i] ? 0 : d, dt: Math.max(0, dt), moving: false });
+      continue;
+    }
+    if (a < runStart[i]) a = runStart[i];
+    while (a < i - 1 && pts[i - 1].t - pts[a + 1].t >= STOP_WINDOW_S) a++;
+    if (b < i) b = i;
+    while (b < runEnd[i] && pts[b].t - pts[i].t < STOP_WINDOW_S) b++;
+    const net = haversineM([sx[a], sy[a]], [sx[b], sy[b]]);
+    let moving = net / Math.max(2 * STOP_WINDOW_S, pts[b].t - pts[a].t) >= SPEED_EPS;
+    if (!moving) {
+      // a hairpin turn nets ~0 displacement but still reaches far from the hop
+      for (let k = a; k <= b && !moving; k++) moving = haversineM([sx[i], sy[i]], [sx[k], sy[k]]) >= STOP_REACH_M;
+    }
+    hops.push({ d, dt, moving });
+  }
+  return hops;
+}
+
 // ── Stats ────────────────────────────────────────────────────────────────────
 
 export interface TrackStats {
@@ -107,91 +248,90 @@ export interface TrackStats {
   maxSpeed: number;
 }
 
-const SPEED_EPS = 0.55; // m/s — below this we consider the athlete stopped
-
-export function trackStats(pts: TrackPoint[]): TrackStats {
+export function trackStats(pts: TrackPoint[], pauses?: Pause[] | null): TrackStats {
+  const hops = motionHops(pts, pauses);
   let dist = 0;
   let moving = 0;
-  let eleGain = 0;
-  let maxSpeed = 0;
-  for (let i = 1; i < pts.length; i++) {
-    const d = haversineM([pts[i - 1].lng, pts[i - 1].lat], [pts[i].lng, pts[i].lat]);
-    const dt = pts[i].t - pts[i - 1].t;
-    if (dt <= 0) continue;
-    const v = d / dt;
-    if (v > SPEED_EPS) {
-      dist += d;
-      moving += dt;
-      if (v > maxSpeed && v < 25) maxSpeed = v;
-    }
-    const de = pts[i].ele - pts[i - 1].ele;
-    if (de > 0) eleGain += de;
+  // cumulative moving distance/time, for a rolling max speed that GPS noise can't spike
+  const cumD = [0];
+  const cumT = [0];
+  for (const h of hops) {
+    if (h.moving) { dist += h.d; moving += h.dt; }
+    cumD.push(dist);
+    cumT.push(cumT[cumT.length - 1] + h.dt);
   }
-  const elapsed = pts.length ? pts[pts.length - 1].t : 0;
+  let maxSpeed = 0;
+  let j = 0;
+  for (let i = 1; i < pts.length; i++) {
+    while (j < i - 1 && cumT[i] - cumT[j + 1] >= MAX_SPEED_WINDOW_S) j++;
+    const span = cumT[i] - cumT[j];
+    if (span >= MAX_SPEED_WINDOW_S) maxSpeed = Math.max(maxSpeed, (cumD[i] - cumD[j]) / span);
+  }
+  const elapsed = pts.length ? pts[pts.length - 1].t - pts[0].t : 0;
   return {
     distanceM: dist,
     elapsedS: elapsed,
     movingS: moving,
-    elevationM: eleGain,
+    elevationM: elevationGain(pts.map((p) => p.ele)),
     avgSpeed: moving > 0 ? dist / moving : 0,
-    maxSpeed,
+    maxSpeed: Math.min(maxSpeed, TELEPORT_SPEED),
   };
 }
 
-// Splits — per unit (1000m / 1609.34m)
+// Splits — per unit (1000m / 1609.34m), boundaries interpolated inside the hop
 export interface SplitCalc {
   index: number;
   distanceM: number;
-  timeS: number;
+  timeS: number; // moving time
   elevationDiff: number;
   paceZone: number;
+  tStart: number; // track time (elapsed) the split began
+  tEnd: number;
 }
 
-export function computeSplits(pts: TrackPoint[], unitM: number): SplitCalc[] {
+export function computeSplits(pts: TrackPoint[], unitM: number, pauses?: Pause[] | null): SplitCalc[] {
   const splits: SplitCalc[] = [];
-  let acc = 0;          // cumulative distance
-  let accTime = 0;      // cumulative moving time
-  let splitStartDist = 0;
-  let splitStartTime = 0;
-  let curIdx = 0;
-  let accStartEle = pts[0]?.ele ?? 0;
+  if (pts.length < 2) return splits;
+  const hops = motionHops(pts, pauses);
+  let acc = 0; // cumulative moving distance
+  let accTime = 0; // cumulative moving time
+  let startDist = 0;
+  let startTime = 0;
+  let startT = pts[0].t;
+  let startEle = pts[0].ele;
 
   for (let i = 1; i < pts.length; i++) {
-    const d = haversineM([pts[i - 1].lng, pts[i - 1].lat], [pts[i].lng, pts[i].lat]);
-    const dt = pts[i].t - pts[i - 1].t;
-    if (dt <= 0) continue;
-    const v = d / dt;
-    if (v > SPEED_EPS) {
-      acc += d;
-      accTime += dt;
-    }
-    if (acc >= (curIdx + 1) * unitM) {
+    const h = hops[i - 1];
+    if (!h.moving || h.d <= 0) continue;
+    const a = pts[i - 1], b = pts[i];
+    while (acc + h.d >= startDist + unitM) {
+      const f = (startDist + unitM - acc) / h.d;
+      const time = accTime + f * h.dt;
+      const t = a.t + f * (b.t - a.t);
+      const ele = a.ele + f * (b.ele - a.ele);
       splits.push({
-        index: curIdx,
-        distanceM: acc - splitStartDist,
-        timeS: accTime - splitStartTime,
-        elevationDiff: (pts[i].ele ?? 0) - accStartEle,
-        paceZone: 0,
+        index: splits.length, distanceM: unitM, timeS: time - startTime,
+        elevationDiff: ele - startEle, paceZone: 0, tStart: startT, tEnd: t,
       });
-      accStartEle = pts[i].ele ?? 0;
-      splitStartDist = acc;
-      splitStartTime = accTime;
-      curIdx++;
+      startDist += unitM;
+      startTime = time;
+      startT = t;
+      startEle = ele;
     }
+    acc += h.d;
+    accTime += h.dt;
   }
   // final partial split
-  if (acc > splitStartDist + 50) {
+  if (acc > startDist + 50) {
+    const last = pts[pts.length - 1];
     splits.push({
-      index: curIdx,
-      distanceM: acc - splitStartDist,
-      timeS: accTime - splitStartTime,
-      elevationDiff: (pts[pts.length - 1]?.ele ?? 0) - accStartEle,
-      paceZone: 0,
+      index: splits.length, distanceM: acc - startDist, timeS: accTime - startTime,
+      elevationDiff: last.ele - startEle, paceZone: 0, tStart: startT, tEnd: last.t,
     });
   }
   // pace zones relative to median split pace
   if (splits.length > 2) {
-    const paces = splits.map((s) => s.timeS / Math.max(1, s.distanceM)).sort((a, b) => a - b);
+    const paces = splits.map((s) => s.timeS / Math.max(1, s.distanceM)).sort((x, y) => x - y);
     const med = paces[Math.floor(paces.length / 2)];
     for (const s of splits) {
       const rel = (med - s.timeS / Math.max(1, s.distanceM)) / med; // positive = faster
@@ -199,6 +339,64 @@ export function computeSplits(pts: TrackPoint[], unitM: number): SplitCalc[] {
     }
   }
   return splits;
+}
+
+// ── Best rolling efforts (fastest moving time over a target distance) ───────
+type EffortPoint = { lng: number; lat: number; t: number; ele?: number };
+
+/** Fastest moving time for each target distance; hops are computed once. */
+export function bestEfforts(pts: EffortPoint[], targetsM: number[], pauses?: Pause[] | null): (number | null)[] {
+  if (pts.length < 5) return targetsM.map(() => null);
+  const hops = motionHops(pts.map((p) => ({ ...p, ele: p.ele ?? 0 })), pauses);
+  const cum: number[] = [0];
+  const cumT: number[] = [0];
+  for (const h of hops) {
+    cum.push(cum[cum.length - 1] + (h.moving ? h.d : 0));
+    cumT.push(cumT[cumT.length - 1] + (h.moving ? h.dt : 0));
+  }
+  return targetsM.map((targetM) => {
+    if (cum[cum.length - 1] < targetM) return null;
+    let best: number | null = null;
+    let j = 0;
+    for (let i = 1; i < cum.length; i++) {
+      if (cum[i] < targetM) continue;
+      // latest start j that still leaves ≥ targetM, then interpolate the exact start
+      while (j + 1 < i && cum[i] - cum[j + 1] >= targetM) j++;
+      const over = cum[i] - cum[j] - targetM;
+      const hopD = cum[j + 1] - cum[j];
+      const startT = hopD > 0 ? cumT[j] + (over / hopD) * (cumT[j + 1] - cumT[j]) : cumT[j];
+      const time = cumT[i] - startT;
+      if (time > 0 && (best === null || time < best)) best = time;
+    }
+    return best;
+  });
+}
+
+export function bestEffort(pts: EffortPoint[], targetM: number, pauses?: Pause[] | null): number | null {
+  return bestEfforts(pts, [targetM], pauses)[0];
+}
+
+/** Stored Track.pauses JSON → validated intervals (null when absent or junk). */
+export function parsePauses(raw: string | null | undefined): Pause[] | null {
+  if (!raw) return null;
+  try {
+    return sanitizePauses(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/** Untrusted pause list → sorted, finite, non-empty intervals (max 500). */
+export function sanitizePauses(raw: unknown): Pause[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: Pause[] = [];
+  for (const x of raw.slice(0, 500)) {
+    if (!Array.isArray(x) || x.length < 2) continue;
+    const a = Number(x[0]), b = Number(x[1]);
+    if (Number.isFinite(a) && Number.isFinite(b) && a >= 0 && b > a) out.push([a, b]);
+  }
+  out.sort((p, q) => p[0] - q[0]);
+  return out.length ? out : null;
 }
 
 // ── Segment matching ─────────────────────────────────────────────────────────

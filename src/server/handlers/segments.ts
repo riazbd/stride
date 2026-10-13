@@ -1,6 +1,6 @@
 import { db } from "@/lib/db";
 import { json, err } from "../session";
-import { LL } from "@/lib/geo";
+import { hasFullAccess } from "../entitlement";
 
 // GET /api/segments?q=&sport=
 export async function listSegments(viewerId: string | null, url: URL): Promise<Response> {
@@ -9,9 +9,9 @@ export async function listSegments(viewerId: string | null, url: URL): Promise<R
   const where: any = {};
   if (sport === "run" || sport === "ride") where.sport = sport;
   if (q) where.OR = [
-    { name: { contains: q } },
-    { city: { contains: q } },
-    { country: { contains: q } },
+    { name: { contains: q, mode: "insensitive" as const } },
+    { city: { contains: q, mode: "insensitive" as const } },
+    { country: { contains: q, mode: "insensitive" as const } },
   ];
   const segs = await db.segment.findMany({ where, orderBy: { starredCount: "desc" }, take: 50 });
   const starred = viewerId
@@ -46,16 +46,24 @@ export async function getSegment(idOrSlug: string, viewerId: string | null): Pro
   });
   if (!seg) return err(404, "Segment not found");
   const viewer = viewerId ? await db.athlete.findUnique({ where: { id: viewerId }, select: { premium: true } }) : null;
-  const isPremium = !!viewer?.premium;
-  const efforts = await db.segmentEffort.findMany({
-    where: { segmentId: seg.id },
-    include: { athlete: { select: { id: true, firstName: true, lastName: true, avatarColor: true, city: true, country: true, premium: true, sex: true, birthday: true } } },
-    orderBy: { timeS: "asc" },
-    take: 300,
-  });
-  const isStarred = viewerId ? !!(await db.segmentStar.findUnique({ where: { segmentId_athleteId: { segmentId: seg.id, athleteId: viewerId } } })) : false;
+  const isPremium = hasFullAccess(viewer);
+  const athleteSelect = { select: { id: true, firstName: true, lastName: true, avatarColor: true, city: true, country: true, premium: true } };
+  // the public board holds efforts from public activities only; your own
+  // efforts (any visibility) are listed under "mine" for you alone
+  const [efforts, ownEfforts, isStarred] = await Promise.all([
+    db.segmentEffort.findMany({
+      where: { segmentId: seg.id, activity: { visibility: "everyone" } },
+      include: { athlete: athleteSelect },
+      orderBy: { timeS: "asc" },
+      take: 300,
+    }),
+    viewerId
+      ? db.segmentEffort.findMany({ where: { segmentId: seg.id, athleteId: viewerId }, include: { athlete: athleteSelect }, orderBy: { timeS: "asc" }, take: 10 })
+      : [],
+    viewerId ? db.segmentStar.findUnique({ where: { segmentId_athleteId: { segmentId: seg.id, athleteId: viewerId } } }).then((s) => !!s) : false,
+  ]);
 
-  const leaderboard = efforts.map((e, i) => ({
+  const entry = (e: (typeof efforts)[number], i: number) => ({
     rank: e.rank ?? i + 1,
     id: e.id,
     timeS: e.timeS,
@@ -67,15 +75,17 @@ export async function getSegment(idOrSlug: string, viewerId: string | null): Pro
       avatarColor: e.athlete.avatarColor, city: e.athlete.city, country: e.athlete.country,
       premium: e.athlete.premium,
     },
-  }));
+  });
+  const leaderboard = efforts.map(entry);
 
   let followingIds = new Set<string>();
   if (viewerId && isPremium) {
     const rels = await db.athleteFollow.findMany({ where: { followerId: viewerId }, select: { followedId: true } });
     followingIds = new Set(rels.map((r) => r.followedId));
   }
-  const mine = leaderboard.filter((l) => l.athlete.id === viewerId);
-  const myRank = mine.length ? mine[0].rank : null;
+  // private efforts have no rank: they never sit on the public board
+  const mine = ownEfforts.map((e) => ({ ...entry(e, 0), rank: e.rank ?? 0 }));
+  const myRank = leaderboard.find((l) => l.athlete.id === viewerId)?.rank ?? null;
 
   // local legends — most efforts on segment (premium only)
   const effortCounts = new Map<string, { count: number; athlete: any }>();
@@ -119,20 +129,37 @@ function OR(idOrSlug: string) {
   return { OR: [{ slug: idOrSlug }, { id: idOrSlug }] } as any;
 }
 
-// POST /api/segments/:id/star (toggle)
-export async function toggleStar(idOrSlug: string, viewerId: string | null): Promise<Response> {
+// POST /api/segments/:id/star { on?: boolean } — sets the star when `on` is
+// given (safe to repeat), toggles it otherwise
+export async function toggleStar(idOrSlug: string, viewerId: string | null, body: any): Promise<Response> {
   if (!viewerId) return err(401, "Sign in required");
   const seg = await db.segment.findFirst({ where: OR(idOrSlug) });
   if (!seg) return err(404, "Segment not found");
-  const existing = await db.segmentStar.findUnique({
-    where: { segmentId_athleteId: { segmentId: seg.id, athleteId: viewerId } },
+  const key = { segmentId: seg.id, athleteId: viewerId };
+  const on: boolean = typeof body?.on === "boolean" ? body.on : !(await db.segmentStar.findUnique({ where: { segmentId_athleteId: key } }));
+  await db.$transaction(async (tx) => {
+    if (on) await tx.segmentStar.createMany({ data: [key], skipDuplicates: true });
+    else await tx.segmentStar.deleteMany({ where: key });
+    await tx.segment.update({ where: { id: seg.id }, data: { starredCount: await tx.segmentStar.count({ where: { segmentId: seg.id } }) } });
   });
-  if (existing) {
-    await db.segmentStar.delete({ where: { id: existing.id } });
-    await db.segment.update({ where: { id: seg.id }, data: { starredCount: { decrement: 1 } } });
-    return json({ isStarred: false });
+  return json({ isStarred: on });
+}
+
+// Leaderboard ranks over public efforts (1 = fastest); efforts from followers-only
+// or private activities get no rank. Run after any change to a segment's efforts.
+export async function rerankSegments(segmentIds: string[]): Promise<void> {
+  for (const segmentId of new Set(segmentIds)) {
+    const efforts = await db.segmentEffort.findMany({
+      where: { segmentId },
+      select: { id: true, rank: true, activity: { select: { visibility: true } } },
+      orderBy: [{ timeS: "asc" }, { date: "asc" }],
+    });
+    let r = 0;
+    const updates: ReturnType<typeof db.segmentEffort.update>[] = [];
+    for (const e of efforts) {
+      const want = e.activity.visibility === "everyone" ? ++r : null;
+      if (e.rank !== want) updates.push(db.segmentEffort.update({ where: { id: e.id }, data: { rank: want } }));
+    }
+    if (updates.length) await db.$transaction(updates);
   }
-  await db.segmentStar.create({ data: { segmentId: seg.id, athleteId: viewerId } });
-  await db.segment.update({ where: { id: seg.id }, data: { starredCount: { increment: 1 } } });
-  return json({ isStarred: true });
 }

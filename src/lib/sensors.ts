@@ -2,9 +2,9 @@
 import { create } from "zustand";
 import { useRecorder } from "./recorder";
 
-// Web Bluetooth LE sensor manager — heart-rate straps (0x180D) and
-// cycling speed & cadence sensors (0x1816), exactly like Strava's
-// "Connect Devices" but running live in the browser.
+// Web Bluetooth LE sensor manager — heart-rate straps (0x180D), cycling
+// speed & cadence sensors (0x1816) and power meters (0x1818), exactly like
+// Strava's "Connect Devices" but running live in the browser.
 
 export type SensorStatus = "idle" | "connecting" | "connected" | "disconnected" | "unsupported";
 
@@ -44,14 +44,26 @@ interface CscState {
   error: string | null;
 }
 
+interface PmState {
+  status: SensorStatus;
+  name: string | null;
+  watts: number | null;
+  cadence: number | null;
+  batteryPct: number | null;
+  error: string | null;
+}
+
 interface SensorsState {
   hrm: HrmState;
   csc: CscState;
+  pm: PmState;
   wheelCircM: number; // bike wheel circumference for speed math
   connectHrm: () => Promise<void>;
   disconnectHrm: () => void;
   connectCsc: () => Promise<void>;
   disconnectCsc: () => void;
+  connectPm: () => Promise<void>;
+  disconnectPm: () => void;
   setWheelCircM: (m: number) => void;
 }
 
@@ -66,19 +78,24 @@ let lastCrankRevs: number | null = null;
 let lastCrankTime: number | null = null;
 let lastWheelRevs: number | null = null;
 let lastWheelTime: number | null = null;
+let pmDevice: any = null;
+let pmWanted = false;
+let pmRetries = 0;
+let pmLastCrankRevs: number | null = null;
+let pmLastCrankTime: number | null = null;
 
 const PREFS_KEY = "stride.sensorPrefs";
-function savePrefs(p: { hrmName?: string | null; cscName?: string | null; wheelCircM?: number }) {
+function savePrefs(p: { hrmName?: string | null; cscName?: string | null; pmName?: string | null; wheelCircM?: number }) {
   try {
     const cur = JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}");
     localStorage.setItem(PREFS_KEY, JSON.stringify({ ...cur, ...p }));
   } catch { /* ignore */ }
 }
-function readPrefs(): { hrmName: string | null; cscName: string | null; wheelCircM: number } {
+function readPrefs(): { hrmName: string | null; cscName: string | null; pmName: string | null; wheelCircM: number } {
   try {
     const p = JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}");
-    return { hrmName: p.hrmName ?? null, cscName: p.cscName ?? null, wheelCircM: typeof p.wheelCircM === "number" ? p.wheelCircM : 2.105 };
-  } catch { return { hrmName: null, cscName: null, wheelCircM: 2.105 }; }
+    return { hrmName: p.hrmName ?? null, cscName: p.cscName ?? null, pmName: p.pmName ?? null, wheelCircM: typeof p.wheelCircM === "number" ? p.wheelCircM : 2.105 };
+  } catch { return { hrmName: null, cscName: null, pmName: null, wheelCircM: 2.105 }; }
 }
 
 // ── Heart-rate measurement (0x2A37) parsing ──────────────────────────────────
@@ -193,12 +210,69 @@ function onCscDisconnect() {
   }, 2500);
 }
 
+// ── Cycling power measurement (0x2A63) parsing ───────────────────────────────
+// flags uint16, instantaneous power sint16 (W), then optional fields in order:
+// bit0 pedal balance (u8), bit2 accumulated torque (u16), bit4 wheel revs
+// (u32 + u16), bit5 crank revs (u16 + u16 1/1024 s) — used for cadence
+function onPmValue(ev: any) {
+  try {
+    const dv: DataView = ev.target.value;
+    const flags = dv.getUint16(0, true);
+    const watts = dv.getInt16(2, true);
+    let off = 4;
+    if (flags & 0x01) off += 1;
+    if (flags & 0x04) off += 2;
+    if (flags & 0x10) off += 6;
+    let cadence: number | null | undefined;
+    if (flags & 0x20 && off + 4 <= dv.byteLength) {
+      const crankRevs = dv.getUint16(off, true);
+      const crankTime = dv.getUint16(off + 2, true);
+      if (pmLastCrankRevs != null && pmLastCrankTime != null) {
+        const dRev = (crankRevs - pmLastCrankRevs + 0x10000) % 0x10000;
+        const dT = (crankTime - pmLastCrankTime + 0x10000) % 0x10000;
+        if (dT > 0 && dRev < 4096) cadence = Math.round((dRev / (dT / 1024)) * 60);
+        else if (dRev === 0) cadence = 0; // coasting: no new crank event
+      }
+      pmLastCrankRevs = crankRevs;
+      pmLastCrankTime = crankTime;
+    }
+    if (watts >= 0 && watts <= 3000) {
+      useRecorder.getState().notePower(watts);
+      useSensors.setState((s) => ({ pm: { ...s.pm, watts, cadence: cadence === undefined ? s.pm.cadence : cadence } }));
+    }
+  } catch { /* malformed packet */ }
+}
+
+function onPmDisconnect() {
+  if (!pmWanted) {
+    useSensors.setState((s) => ({ pm: { ...s.pm, status: "idle", watts: null, cadence: null } }));
+    return;
+  }
+  pmRetries++;
+  if (pmRetries > 5) {
+    pmWanted = false;
+    useSensors.setState((s) => ({ pm: { ...s.pm, status: "disconnected", watts: null, cadence: null, error: "Power meter disconnected — out of range?" } }));
+    return;
+  }
+  useSensors.setState((s) => ({ pm: { ...s.pm, status: "connecting" } }));
+  setTimeout(async () => {
+    try {
+      const server = await pmDevice?.gatt?.connect();
+      if (!server) throw new Error("gone");
+      pmRetries = 0;
+      useSensors.setState((s) => ({ pm: { ...s.pm, status: "connected", error: null } }));
+    } catch { onPmDisconnect(); }
+  }, 2500);
+}
+
 const initialHrm: HrmState = { status: "idle", name: null, hr: null, rrMs: null, batteryPct: null, lastBeatAt: null, contact: null, error: null };
 const initialCsc: CscState = { status: "idle", name: null, cadence: null, speedKmh: null, batteryPct: null, error: null };
+const initialPm: PmState = { status: "idle", name: null, watts: null, cadence: null, batteryPct: null, error: null };
 
 export const useSensors = create<SensorsState>((set, get) => ({
   hrm: initialHrm,
   csc: initialCsc,
+  pm: initialPm,
   wheelCircM: readPrefs().wheelCircM,
 
   connectHrm: async () => {
@@ -282,6 +356,47 @@ export const useSensors = create<SensorsState>((set, get) => ({
     set((s) => ({ csc: { ...s.csc, status: "idle", cadence: null, speedKmh: null, batteryPct: null } }));
   },
 
+  connectPm: async () => {
+    const nav: any = typeof navigator === "undefined" ? null : navigator;
+    if (!nav?.bluetooth) {
+      set((s) => ({ pm: { ...s.pm, status: "unsupported", error: "This browser can't pair Bluetooth sensors" } }));
+      return;
+    }
+    set((s) => ({ pm: { ...s.pm, status: "connecting", error: null } }));
+    pmWanted = true;
+    pmRetries = 0;
+    pmLastCrankRevs = null; pmLastCrankTime = null;
+    try {
+      const device = await nav.bluetooth.requestDevice({
+        filters: [{ services: ["cycling_power"] }],
+        optionalServices: ["battery_service", "device_information"],
+      });
+      pmDevice = device;
+      device.addEventListener("gattserverdisconnected", onPmDisconnect);
+      const server = await device.gatt.connect();
+      const svc = await server.getPrimaryService("cycling_power");
+      const chr = await svc.getCharacteristic("cycling_power_measurement");
+      await chr.startNotifications();
+      chr.addEventListener("characteristicvaluechanged", onPmValue);
+      const batteryPct = await readBattery(server);
+      pmRetries = 0;
+      set((s) => ({
+        pm: { ...s.pm, status: "connected", name: device.name ?? "Power meter", batteryPct, error: null },
+      }));
+      savePrefs({ pmName: device.name ?? "Power meter" });
+    } catch (e: any) {
+      pmWanted = false;
+      const msg = e?.name === "NotFoundError" ? "No device selected" : (e?.message ?? "Connection failed");
+      set((s) => ({ pm: { ...s.pm, status: "idle", error: msg } }));
+    }
+  },
+
+  disconnectPm: () => {
+    pmWanted = false;
+    try { pmDevice?.gatt?.disconnect(); } catch { /* ignore */ }
+    set((s) => ({ pm: { ...s.pm, status: "idle", watts: null, cadence: null, batteryPct: null } }));
+  },
+
   setWheelCircM: (m) => {
     const v = Math.max(1.5, Math.min(2.4, Math.round(m * 1000) / 1000));
     set({ wheelCircM: v });
@@ -292,3 +407,4 @@ export const useSensors = create<SensorsState>((set, get) => ({
 // remembered last device names (for "reconnect Polar H10" hints)
 export function rememberedHrmName(): string | null { return readPrefs().hrmName; }
 export function rememberedCscName(): string | null { return readPrefs().cscName; }
+export function rememberedPmName(): string | null { return readPrefs().pmName; }

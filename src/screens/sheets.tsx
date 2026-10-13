@@ -10,6 +10,19 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
+import { distUnit, elevUnit, metersToDist, distToMeters, metersToElev, elevToMeters, type Units } from "@/lib/format";
+
+// goals are stored in SI (metres, seconds); the editor speaks the athlete's units
+function goalToInput(metric: string, si: number, units: Units): number {
+  if (metric === "time") return Math.round((si / 3600) * 10) / 10;
+  if (metric === "elevation") return Math.round(metersToElev(si, units));
+  return Math.round(metersToDist(si, units) * 10) / 10;
+}
+function inputToGoal(metric: string, v: number, units: Units): number {
+  if (metric === "time") return Math.round(v * 3600);
+  if (metric === "elevation") return Math.round(elevToMeters(v, units));
+  return Math.round(distToMeters(v, units));
+}
 
 export function SheetShell({ children, title }: { children: React.ReactNode; title: string }) {
   const nav = useNav();
@@ -125,6 +138,62 @@ export function CommentBoxSheet({ target }: { target: { activityId: string } | {
   );
 }
 
+const REPORT_REASONS = [
+  { id: "spam", label: "Spam or advertising" },
+  { id: "fake", label: "Fake or impossible activity (e.g. recorded in a car)" },
+  { id: "harassment", label: "Harassment or hate" },
+  { id: "inappropriate", label: "Inappropriate content" },
+  { id: "privacy", label: "Shows someone's private information" },
+  { id: "other", label: "Something else" },
+];
+
+// Sends a report to the moderation queue (POST /api/reports)
+export function ReportForm({ targetType, targetId, onDone }: { targetType: string; targetId: string; onDone: () => void }) {
+  const { toast } = useToast();
+  const [reason, setReason] = useState<string | null>(null);
+  const [details, setDetails] = useState("");
+  const [sending, setSending] = useState(false);
+  const send = async () => {
+    if (!reason) return;
+    setSending(true);
+    try {
+      await api.post("reports", { targetType, targetId, reason, details: details.trim() || undefined });
+      toast({ description: "Thanks — our team will review this report." });
+      onDone();
+    } catch (e: any) {
+      toast({ description: e.message ?? "Could not send the report" });
+    } finally {
+      setSending(false);
+    }
+  };
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-col">
+        {REPORT_REASONS.map((r) => (
+          <button key={r.id} onClick={() => setReason(r.id)} className={cn("flex items-center gap-2.5 py-2.5 w-full text-left", reason === r.id && "text-primary")}>
+            <span className="w-4 shrink-0">{reason === r.id && <Check size={15} />}</span>
+            <span className="text-[13.5px] font-semibold">{r.label}</span>
+          </button>
+        ))}
+      </div>
+      <Textarea
+        value={details}
+        onChange={(e) => setDetails(e.target.value)}
+        maxLength={1000}
+        placeholder="Anything we should know? (optional)"
+        className="min-h-[70px] bg-muted/60 border-0 focus-visible:ring-2 focus-visible:ring-primary resize-none"
+      />
+      <button
+        onClick={send}
+        disabled={!reason || sending}
+        className="h-11 rounded-lg bg-primary text-primary-foreground font-bold text-[14px] flex items-center justify-center gap-1.5 disabled:opacity-50"
+      >
+        {sending && <Loader2 size={15} className="animate-spin" />} Send report
+      </button>
+    </div>
+  );
+}
+
 export function ActivityOptionsSheet({ activityId }: { activityId: string }) {
   const nav = useNav();
   const qc = useQueryClient();
@@ -139,6 +208,7 @@ export function ActivityOptionsSheet({ activityId }: { activityId: string }) {
   const [description, setDescription] = useState("");
   const [visibility, setVisibility] = useState("everyone");
   const [saving, setSaving] = useState(false);
+  const [reporting, setReporting] = useState(false);
 
   useEffect(() => {
     if (a) {
@@ -181,6 +251,14 @@ export function ActivityOptionsSheet({ activityId }: { activityId: string }) {
 
   const mine = a && me ? a.athlete.id === me.id : false;
 
+  if (reporting) {
+    return (
+      <SheetShell title="Report activity">
+        <ReportForm targetType="activity" targetId={activityId} onDone={() => nav.closeSheet()} />
+      </SheetShell>
+    );
+  }
+
   return (
     <SheetShell title={editing ? "Edit Activity" : "Activity Options"}>
       {!editing ? (
@@ -189,17 +267,17 @@ export function ActivityOptionsSheet({ activityId }: { activityId: string }) {
             <>
               <SheetAction icon={Pencil} label="Edit activity" onClick={() => setEditing(true)} />
               <SheetAction icon={Trash2} label="Delete activity" danger onClick={del} />
+              <SheetAction
+                icon={FileDown}
+                label="Export GPX file"
+                onClick={() => {
+                  window.location.assign(`/api/activities/${activityId}/gpx`);
+                  toast({ description: "GPX file downloading…" });
+                  nav.closeSheet();
+                }}
+              />
             </>
           )}
-          <SheetAction
-            icon={FileDown}
-            label="Export GPX file"
-            onClick={() => {
-              window.location.assign(`/api/activities/${activityId}/gpx`);
-              toast({ description: "GPX file downloading…" });
-              nav.closeSheet();
-            }}
-          />
           <SheetAction
             icon={Share2}
             label="Share…"
@@ -216,7 +294,7 @@ export function ActivityOptionsSheet({ activityId }: { activityId: string }) {
               nav.closeSheet();
             }}
           />
-          <SheetAction icon={Flag} label="Report flag issue" onClick={() => { toast({ description: "Flag submitted for review" }); nav.closeSheet(); }} />
+          {!mine && <SheetAction icon={Flag} label="Report activity" onClick={() => setReporting(true)} />}
         </div>
       ) : (
         <div className="flex flex-col gap-4">
@@ -270,6 +348,7 @@ export function GoalEditorSheet() {
   const qc = useQueryClient();
   const { toast } = useToast();
   const premium = useUI((s) => !!s.me?.premium);
+  const units = (useUI((s) => s.me?.units) ?? "km") as Units;
   const [period, setPeriod] = useState<"weekly" | "monthly" | "yearly">("weekly");
   const [metric, setMetric] = useState<"distance" | "time" | "elevation">("distance");
   const [sport, setSport] = useState<"all" | "run" | "ride">("all");
@@ -280,17 +359,17 @@ export function GoalEditorSheet() {
   useEffect(() => {
     api.get("me/goals").then((res: any) => {
       const g = res.goals?.find((g: any) => g.metric === metric && g.period === period && (g.sport ?? "all") === sport);
-      if (g) setTarget(String(g.target));
+      if (g) setTarget(String(goalToInput(metric, g.target, units)));
       else setTarget(defaultTarget(period, metric));
       setLoaded(true);
     }).catch(() => { setTarget(defaultTarget(period, metric)); setLoaded(true); });
      
-  }, [period, metric, sport]);
+  }, [period, metric, sport, units]);
 
   const save = async () => {
     setSaving(true);
     try {
-      await api.post("me/goals", { metric, period, sport: sport === "all" ? null : sport, target: parseFloat(target) || 0 });
+      await api.post("me/goals", { metric, period, sport: sport === "all" ? null : sport, target: inputToGoal(metric, parseFloat(target) || 0, units) });
       qc.invalidateQueries({ queryKey: ["me", "goals"] });
       qc.invalidateQueries({ queryKey: ["feed", "summary"] });
       qc.invalidateQueries({ queryKey: ["profile"] });
@@ -304,7 +383,7 @@ export function GoalEditorSheet() {
   };
 
   const metricLabel = metric === "distance" ? "Distance" : metric === "time" ? "Time" : "Elevation";
-  const metricUnit = metric === "distance" ? "km" : metric === "time" ? "hours" : "m";
+  const metricUnit = metric === "distance" ? distUnit(units) : metric === "time" ? "hours" : elevUnit(units);
 
   return (
     <SheetShell title="Edit Goal">
@@ -384,7 +463,7 @@ export function GoalEditorSheet() {
           {saving && <Loader2 size={16} className="animate-spin" />} Save Goal
         </button>
         <p className="text-[11.5px] text-muted-foreground text-center leading-relaxed">
-          Saving with 0 removes the goal. Monthly & yearly goals are a Premium feature.
+          Saving with 0 removes the goal.
         </p>
       </div>
     </SheetShell>

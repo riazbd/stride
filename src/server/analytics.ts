@@ -1,36 +1,8 @@
 import { db } from "@/lib/db";
-import { haversineM } from "@/lib/geo";
+import { bestEfforts, decodeTrack, parsePauses } from "@/lib/geo";
 
-// ─── Best rolling efforts from a GPS track ───────────────────────────────────
-
-export function bestEffort(
-  pts: { lng: number; lat: number; t: number }[],
-  targetM: number
-): number | null {
-  if (pts.length < 5) return null;
-  // cumulative distance & moving time arrays
-  const cum: number[] = [0];
-  const cumT: number[] = [0];
-  for (let i = 1; i < pts.length; i++) {
-    const d = haversineM([pts[i - 1].lng, pts[i - 1].lat], [pts[i].lng, pts[i].lat]);
-    const dt = pts[i].t - pts[i - 1].t;
-    const v = dt > 0 ? d / dt : 99;
-    const moving = v > 0.55 && v < 25;
-    cum.push(cum[i - 1] + (moving ? d : 0));
-    cumT.push(cumT[i - 1] + (moving ? dt : 0));
-  }
-  let best: number | null = null;
-  let j = 0;
-  for (let i = 0; i < pts.length; i++) {
-    if (cum[i] < targetM) continue;
-    while (j < i && cum[i] - cum[j] > targetM) j++;
-    if (cum[i] - cum[j] >= targetM * 0.999) {
-      const time = cumT[i] - cumT[j];
-      if (time > 0 && (best === null || time < best)) best = time;
-    }
-  }
-  return best;
-}
+// best rolling efforts live with the motion model so they share its moving/stopped logic
+export { bestEffort } from "@/lib/geo";
 
 export const BEST_DISTANCES = [
   { d: 1000, label: "1K" },
@@ -52,39 +24,40 @@ export interface PRRecord {
   activityTitle: string | null;
 }
 
-export async function personalRecords(athleteId: string): Promise<PRRecord[]> {
+const RUN_SPORTS = ["run", "trail_run"];
+
+// `visible` narrows to the activities a viewer may see (see visibility.ts);
+// the owner passes nothing and gets every activity
+export async function personalRecords(athleteId: string, visible: object = {}): Promise<PRRecord[]> {
   const acts = await db.activity.findMany({
-    where: { athleteId, isTrainer: false, distanceM: { gte: 1000 } },
+    where: { athleteId, isTrainer: false, distanceM: { gte: 1000 }, ...visible },
     select: {
       id: true, title: true, startDate: true, sport: true,
-      track: { select: { points: true } },
+      track: { select: { points: true, pauses: true } },
     },
     orderBy: { startDate: "asc" },
   });
-  const prs: PRRecord[] = [];
-  const isRunSport = (s: string) => ["run", "trail_run"].includes(s);
-  for (const dist of BEST_DISTANCES) {
-    let best: PRRecord | null = null;
-    for (const a of acts) {
-      if (dist.d >= 21097 ? !isRunSport(a.sport) : !isRunSport(a.sport)) {
-        // distance PRs computed for running; 40K TT for rides
-        if (dist.label === "40K TT" && a.sport !== "ride") continue;
-        if (dist.label !== "40K TT" && a.sport !== "run") continue;
-      }
-      if (!a.track) continue;
-      let pts: { lng: number; lat: number; t: number }[];
-      try {
-        pts = JSON.parse(a.track.points).map((p: number[]) => ({ lng: p[0], lat: p[1], t: p[3] }));
-      } catch {
-        continue;
-      }
-      const best1 = bestEffort(pts, dist.d);
-      if (best1 && (!best || best1 < best.timeS)) {
-        best = { distance: dist.d, label: dist.label, timeS: best1, activityId: a.id, startDate: a.startDate.toISOString(), activityTitle: a.title };
-      }
+  // distance PRs for running, 40K TT for rides — each track is decoded once
+  const best = new Map<string, PRRecord>();
+  for (const a of acts) {
+    const dists = BEST_DISTANCES.filter((d) => (d.label === "40K TT" ? a.sport === "ride" : RUN_SPORTS.includes(a.sport)));
+    if (!dists.length || !a.track) continue;
+    let pts;
+    try {
+      pts = decodeTrack(a.track.points);
+    } catch {
+      continue;
     }
-    if (best) prs.push(best);
+    const times = bestEfforts(pts, dists.map((d) => d.d), parsePauses(a.track.pauses));
+    dists.forEach((dist, i) => {
+      const t = times[i];
+      const cur = best.get(dist.label);
+      if (t && (!cur || t < cur.timeS)) {
+        best.set(dist.label, { distance: dist.d, label: dist.label, timeS: t, activityId: a.id, startDate: a.startDate.toISOString(), activityTitle: a.title });
+      }
+    });
   }
+  const prs = BEST_DISTANCES.map((d) => best.get(d.label)).filter((p): p is PRRecord => !!p);
   return prs;
 }
 
@@ -190,18 +163,22 @@ export interface FitnessPoint {
   load: number; // daily TRIMP-ish (relative effort)
 }
 
+// calendar day where the activity happened, in its own time zone
+export function localDayKey(startDate: Date, tzOffsetMin: number): string {
+  return new Date(startDate.getTime() + tzOffsetMin * 60000).toISOString().slice(0, 10);
+}
+
 export async function fitnessSeries(athleteId: string, days = 90): Promise<FitnessPoint[]> {
   const from = new Date(Date.now() - (days + 30) * 86400000);
   const rows = await db.activity.findMany({
     where: { athleteId, startDate: { gte: from } },
-    select: { startDate: true, relativeEffort: true, movingTimeS: true, avgHr: true },
+    select: { startDate: true, tzOffsetMin: true, relativeEffort: true },
   });
   // daily load map
   const daily = new Map<string, number>();
-  for (const r of rows as any[]) {
-    const key = r.startDate.toISOString().slice(0, 10);
-    const load = r.relativeEffort ?? Math.round((r.movingTimeS / 3600) * 55);
-    daily.set(key, (daily.get(key) ?? 0) + load);
+  for (const r of rows) {
+    const key = localDayKey(r.startDate, r.tzOffsetMin);
+    daily.set(key, (daily.get(key) ?? 0) + (r.relativeEffort ?? 0));
   }
   let ctl = 0, atl = 0;
   const out: FitnessPoint[] = [];
@@ -234,12 +211,13 @@ export interface TrainingDay {
   activities: { id: string; sport: string; title: string | null; distanceM: number; movingTimeS: number }[];
 }
 
-export async function trainingLog(athleteId: string, year: number, month: number): Promise<TrainingDay[]> {
-  const start = new Date(Date.UTC(year, month, 1));
-  const end = new Date(Date.UTC(year, month + 1, 1));
+export async function trainingLog(athleteId: string, year: number, month: number, visible: object = {}): Promise<TrainingDay[]> {
+  // a day either side, then bucket by each activity's local date
+  const start = new Date(Date.UTC(year, month, 1) - 86400000);
+  const end = new Date(Date.UTC(year, month + 1, 1) + 86400000);
   const rows = await db.activity.findMany({
-    where: { athleteId, startDate: { gte: start, lt: end } },
-    select: { id: true, sport: true, title: true, distanceM: true, movingTimeS: true, startDate: true },
+    where: { athleteId, startDate: { gte: start, lt: end }, ...visible },
+    select: { id: true, sport: true, title: true, distanceM: true, movingTimeS: true, startDate: true, tzOffsetMin: true },
     orderBy: { startDate: "asc" },
   });
   const byDay = new Map<string, TrainingDay>();
@@ -249,7 +227,7 @@ export async function trainingLog(athleteId: string, year: number, month: number
     byDay.set(key, { date: key, distanceM: 0, movingTimeS: 0, activities: [] });
   }
   for (const r of rows) {
-    const key = r.startDate.toISOString().slice(0, 10);
+    const key = localDayKey(r.startDate, r.tzOffsetMin);
     const day = byDay.get(key);
     if (!day) continue;
     day.distanceM += r.distanceM;
@@ -287,7 +265,7 @@ export async function challengeProgress(athleteId: string, challenge: any): Prom
 }
 
 function challengeSportFilter(c: any) {
-  const map: Record<string, string[]> = {
+  const map: Record<string, string[] | undefined> = {
     run: ["run", "trail_run"],
     ride: ["ride", "gravel", "mtb", "ebike", "virtual_ride"],
     walk: ["walk", "hike"],
@@ -297,6 +275,45 @@ function challengeSportFilter(c: any) {
   const sports = map[c.category];
   if (!sports) return {};
   return { sport: { in: sports } };
+}
+
+// Marks every joined, still-open challenge the athlete has now finished and
+// tells them. Runs after an activity is saved or edited and when they join.
+// Returns the slugs completed by this call.
+export async function evaluateChallenges(athleteId: string, now = new Date()): Promise<string[]> {
+  const entries = await db.challengeEntry.findMany({
+    where: { athleteId, completedAt: null, challenge: { startDate: { lte: now }, endDate: { gte: new Date(now.getTime() - 86400000) } } },
+    include: { challenge: true },
+  });
+  const done: string[] = [];
+  for (const e of entries) {
+    const progress = await challengeProgress(athleteId, e.challenge);
+    if (progress < e.challenge.goalValue) continue;
+    // only the first caller to flip completedAt sends the notification
+    const claimed = await db.challengeEntry.updateMany({ where: { id: e.id, completedAt: null }, data: { completedAt: now } });
+    if (claimed.count !== 1) continue;
+    await db.notification.create({
+      data: {
+        recipientId: athleteId, type: "challenge_milestone", challengeId: e.challengeId,
+        text: `You completed ${e.challenge.title}! Your badge is on your trophy case.`,
+      },
+    });
+    done.push(e.challenge.slug);
+  }
+  return done;
+}
+
+// ─── Gear mileage ────────────────────────────────────────────────────────────
+
+// Gear.distanceM is a cache of the distance of every activity using that gear;
+// recomputing it (rather than adding and subtracting) keeps it right through
+// edits, re-assignments and deletions.
+export async function refreshGearDistance(gearIds: (string | null | undefined)[]): Promise<void> {
+  const ids = [...new Set(gearIds.filter((g): g is string => !!g))];
+  for (const id of ids) {
+    const sum = await db.activity.aggregate({ where: { gearId: id }, _sum: { distanceM: true } });
+    await db.gear.updateMany({ where: { id }, data: { distanceM: sum._sum.distanceM ?? 0 } });
+  }
 }
 
 // ─── Streak (consecutive active weeks) ───────────────────────────────────────

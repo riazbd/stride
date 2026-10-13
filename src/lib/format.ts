@@ -10,6 +10,25 @@ export function fmtDist(meters: number, units: Units, digits = 2): string {
 export function distUnit(units: Units): string {
   return units === "km" ? "km" : "mi";
 }
+
+// The server stores SI (metres, seconds). These convert what the athlete types
+// in their own units, and back for showing it in an input.
+export function distToMeters(value: number, units: Units): number {
+  return value * (units === "km" ? 1000 : MI);
+}
+export function metersToDist(meters: number, units: Units): number {
+  return meters / (units === "km" ? 1000 : MI);
+}
+export const FT = 0.3048;
+export function elevUnit(units: Units): string {
+  return units === "km" ? "m" : "ft";
+}
+export function elevToMeters(value: number, units: Units): number {
+  return units === "km" ? value : value * FT;
+}
+export function metersToElev(meters: number, units: Units): number {
+  return units === "km" ? meters : meters / FT;
+}
 export function fmtDistFull(meters: number, units: Units): string {
   return `${fmtDist(meters, units)} ${distUnit(units)}`;
 }

@@ -23,7 +23,7 @@ export function ActivityScreen({ id }: { id: string }) {
   const premium = usePremium();
   const [splitsOpen, setSplitsOpen] = useState(true);
   const [lapsOpen, setLapsOpen] = useState(false);
-  const [analysisTab, setAnalysisTab] = useState<"elevation" | "pace" | "hr" | "gap">("elevation");
+  const [analysisTab, setAnalysisTab] = useState<"elevation" | "pace" | "hr" | "gap" | "power">("elevation");
 
   const { data, isLoading } = useQuery({
     queryKey: ["activity", id],
@@ -144,17 +144,23 @@ export function ActivityScreen({ id }: { id: string }) {
             ) : (
               <BigStat label="Avg Speed" value={speedOf(a.distanceM, a.movingTimeS, units).toFixed(1)} sub={units === "km" ? "km/h" : "mph"} />
             )}
-            {paceMode === "pace" && a.maxSpeed && a.sport === "ride" ? (
-              <BigStat label="Max Speed" value={speedOf(a.distanceM / (a.movingTimeS / (a.distanceM / a.maxSpeed)), a.movingTimeS, units).toFixed(1)} sub={units === "km" ? "km/h" : "mph"} />
-            ) : (
-              <BigStat label="Elevation" value={fmtElev(a.elevationM, units)} />
-            )}
+            <BigStat label="Elevation" value={fmtElev(a.elevationM, units)} />
+            {paceMode === "speed" && a.maxSpeed ? (
+              <BigStat label="Max Speed" value={speedOf(a.maxSpeed, 1, units).toFixed(1)} sub={units === "km" ? "km/h" : "mph"} muted />
+            ) : null}
+            {a.avgWatts != null && <BigStat label="Avg Power" value={`${a.avgWatts}`} sub="W" muted />}
+            {a.maxWatts != null && <BigStat label="Max Power" value={`${a.maxWatts}`} sub="W" muted />}
             <BigStat label="Elapsed" value={fmtDuration(a.elapsedTimeS)} muted />
             {a.calories != null && <BigStat label="Calories" value={String(a.calories)} muted />}
             {a.avgHr != null && <BigStat label="Avg HR" value={`${a.avgHr}`} sub="bpm" muted />}
             {a.maxHr != null && <BigStat label="Max HR" value={`${a.maxHr}`} sub="bpm" muted />}
-            {a.calories != null && a.avgHr != null && (
-              <BigStat label="Relative Effort" value={String(a.relativeEffort ?? "—")} muted />
+            {a.relativeEffort != null && (
+              <BigStat
+                label="Training Load"
+                value={String(a.relativeEffort)}
+                sub={a.effortSource === "hr" ? "heart rate" : a.effortSource === "rpe" ? "your rating" : "estimate"}
+                muted
+              />
             )}
           </div>
           <div className="mt-4 pt-3 border-t border-border flex items-center justify-between text-[11px] text-muted-foreground">
@@ -220,7 +226,7 @@ export function ActivityScreen({ id }: { id: string }) {
                         {paceMode === "pace" ? (
                           <span className="tnum text-[13px] flex-1 text-right font-medium">{fmtPace(units === "mi" ? s.timeS / Math.max(1, s.distanceM / unitM) : pace)} /{splitLabel}</span>
                         ) : (
-                          <span className="tnum text-[13px] flex-1 text-right font-medium">{((s.distanceM / Math.max(1, s.timeS)) * 3.6).toFixed(1)} km/h</span>
+                          <span className="tnum text-[13px] flex-1 text-right font-medium">{speedOf(s.distanceM, Math.max(1, s.timeS), units).toFixed(1)} {units === "km" ? "km/h" : "mph"}</span>
                         )}
                         {s.avgHr && <span className="tnum text-[11px] text-muted-foreground w-14 text-right">{s.avgHr} bpm</span>}
                       </div>
@@ -247,7 +253,7 @@ export function ActivityScreen({ id }: { id: string }) {
                 <span className="tnum text-[13px] w-20 font-medium">{fmtDist(l.distanceM, units, 2)} {splitLabel}</span>
                 <span className="tnum text-[13px] font-medium">{fmtDuration(l.timeS)}</span>
                 {paceMode === "pace" && (
-                  <span className="tnum text-[13px] flex-1 text-right font-medium">{fmtPace(l.timeS / Math.max(1, l.distanceM / 1000))} /km</span>
+                  <span className="tnum text-[13px] flex-1 text-right font-medium">{fmtPace(paceOf(l.distanceM, l.timeS, units))} /{splitLabel}</span>
                 )}
               </div>
             ))}
@@ -263,7 +269,8 @@ export function ActivityScreen({ id }: { id: string }) {
               {([
                 ["elevation", "Elevation"],
                 ["pace", paceMode === "speed" ? "Speed" : "Pace"],
-                ["hr", "Heart Rate"],
+                ...(analysis.data?.hasHr ? [["hr", "Heart Rate"] as const] : []),
+                ...(analysis.data?.hasPower ? [["power", "Power"] as const] : []),
                 ...(isPaceSport ? [["gap", "GAP"] as const] : []),
               ] as [any, string][]).map(([t, label]) => (
                 <button
@@ -292,7 +299,12 @@ export function ActivityScreen({ id }: { id: string }) {
                   />
                 </div>
               ) : analysis.data?.series?.length ? (
-                <AnalysisChart series={analysis.data.series} kind={analysisTab} units={units} />
+                <AnalysisChart
+                  series={analysis.data.series}
+                  kind={analysisTab === "hr" && !analysis.data.hasHr ? "elevation" : analysisTab}
+                  units={units}
+                  speedMode={paceMode === "speed"}
+                />
               ) : (
                 <div className="h-[100px] flex items-center justify-center text-[12px] text-muted-foreground">No analysis data</div>
               )}
@@ -301,8 +313,8 @@ export function ActivityScreen({ id }: { id: string }) {
         </div>
       )}
 
-      {/* heart-rate zones (premium) */}
-      {a.hasTrack && a.avgHr != null && (
+      {/* heart-rate zones (premium) — only from heart rate a sensor recorded */}
+      {a.hasTrack && analysis.data?.hasHr && (
         <div className="px-4 pt-4">
           <div className="bg-card border border-border rounded-lg overflow-hidden">
             <div className="px-4 py-3 text-[13px] font-bold uppercase tracking-wider text-muted-foreground flex items-center justify-between">
@@ -356,7 +368,7 @@ export function ActivityScreen({ id }: { id: string }) {
             </span>
             <div className="flex-1">
               <div className="text-[12px] uppercase tracking-wide font-bold text-muted-foreground">Avg grade-adjusted pace</div>
-              <div className="tnum text-[20px] font-bold">{fmtPace(analysis.data.avgGap)} <span className="text-[12px] font-semibold text-muted-foreground">/{distUnit(units)}</span></div>
+              <div className="tnum text-[20px] font-bold">{fmtPace(units === "km" ? analysis.data.avgGap : analysis.data.avgGap * (MI / 1000))} <span className="text-[12px] font-semibold text-muted-foreground">/{distUnit(units)}</span></div>
             </div>
             <div className="tnum text-[11.5px] text-muted-foreground text-right">
               <div className="font-semibold text-foreground">{fmtPace(paceOf(a.distanceM, a.movingTimeS, units))}</div>

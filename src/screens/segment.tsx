@@ -31,7 +31,7 @@ export function SegmentScreen({ slug }: { slug: string }) {
       const was = data.isStarred;
       qc.setQueryData(["segment", slug], { ...data, isStarred: !was });
       try {
-        await api.post(`segments/${slug}/star`);
+        await api.post(`segments/${slug}/star`, { on: !was });
         toast({ description: was ? "Star removed" : "Segment starred" });
       } catch {
         qc.setQueryData(["segment", slug], data);

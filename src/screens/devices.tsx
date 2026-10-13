@@ -1,9 +1,9 @@
 "use client";
 import React, { useState } from "react";
 import { motion } from "framer-motion";
-import { HeartPulse, Gauge, FileUp, Loader2, RefreshCw, BatteryMedium, Bluetooth, BluetoothOff, CircleDot, CircleDashed, Info } from "lucide-react";
+import { HeartPulse, Gauge, Zap, FileUp, Loader2, RefreshCw, BatteryMedium, Bluetooth, BluetoothOff, CircleDot, CircleDashed, Info } from "lucide-react";
 import { useNav, useUI } from "@/lib/nav";
-import { useSensors, ZONE_COLORS, ZONE_NAMES, hrZoneIndex, bluetoothSupported, rememberedHrmName, rememberedCscName } from "@/lib/sensors";
+import { useSensors, ZONE_COLORS, ZONE_NAMES, hrZoneIndex, bluetoothSupported, rememberedHrmName, rememberedCscName, rememberedPmName } from "@/lib/sensors";
 import { ScreenHeader } from "@/components/app/shell";
 import { SegmentedTabs } from "@/components/app/ui";
 import { cn } from "@/lib/utils";
@@ -34,12 +34,13 @@ function StatusPill({ status }: { status: string }) {
 export function DevicesScreen() {
   const nav = useNav();
   const me = useUI((s) => s.me);
-  const { hrm, csc, wheelCircM, connectHrm, disconnectHrm, connectCsc, disconnectCsc, setWheelCircM } = useSensors();
+  const { hrm, csc, pm, wheelCircM, connectHrm, disconnectHrm, connectCsc, disconnectCsc, connectPm, disconnectPm, setWheelCircM } = useSensors();
   const [wheelOpen, setWheelOpen] = useState(false);
   const supported = bluetoothSupported();
   const maxHr = me?.maxHr ?? 190;
   const lastHrm = rememberedHrmName();
   const lastCsc = rememberedCscName();
+  const lastPm = rememberedPmName();
 
   const hrZone = hrm.hr ? hrZoneIndex(hrm.hr, maxHr) : null;
 
@@ -138,6 +139,75 @@ export function DevicesScreen() {
             )}
             {hrm.status === "idle" && hrm.error && hrm.error !== "No device selected" && (
               <div className="text-[11.5px] text-destructive mt-2">{hrm.error}</div>
+            )}
+          </div>
+
+          {/* power meter */}
+          <div className="border-t border-border p-4">
+            <div className="flex items-center gap-3">
+              <span className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+                <Zap size={20} className="text-primary" />
+              </span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[14px] font-bold truncate">{pm.name ?? "Power meter"}</div>
+                <div className="text-[11.5px] text-muted-foreground">
+                  {pm.status === "connected"
+                    ? pm.name
+                    : pm.status === "connecting"
+                      ? "Waiting for device…"
+                      : pm.status === "disconnected"
+                        ? pm.error ?? "Lost connection"
+                        : lastPm
+                          ? `Reconnect ${lastPm} · any BLE power meter`
+                          : "Pedals · cranks · smart trainers"}
+                </div>
+              </div>
+              {pm.status === "connected" || pm.status === "connecting" || pm.status === "disconnected" ? (
+                <button
+                  onClick={pm.status === "connected" ? disconnectPm : connectPm}
+                  className={cn(
+                    "flex items-center gap-1.5 px-3.5 h-9 rounded-lg text-[12.5px] font-bold active:scale-95 transition-transform shrink-0",
+                    pm.status === "connected" ? "bg-muted text-foreground" : "bg-primary text-primary-foreground"
+                  )}
+                >
+                  {pm.status === "connecting" ? <Loader2 size={14} className="animate-spin" /> : pm.status === "connected" ? <BluetoothOff size={14} /> : <RefreshCw size={14} />}
+                  {pm.status === "connected" ? "Disconnect" : pm.status === "disconnected" ? "Reconnect" : "Pairing…"}
+                </button>
+              ) : (
+                <button
+                  onClick={connectPm}
+                  className="flex items-center gap-1.5 px-3.5 h-9 rounded-lg bg-primary text-primary-foreground text-[12.5px] font-bold active:scale-95 transition-transform shrink-0"
+                >
+                  <Bluetooth size={14} /> Connect
+                </button>
+              )}
+            </div>
+
+            {pm.status === "connected" && (
+              <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} className="overflow-hidden">
+                <div className="mt-4 grid grid-cols-2 gap-3">
+                  <div className="rounded-lg bg-muted/60 border border-border p-3.5">
+                    <div className="flex items-baseline gap-1.5">
+                      <span className="tnum text-[28px] font-extrabold leading-none tabular-nums">{pm.watts ?? "--"}</span>
+                      <span className="text-[11px] font-bold text-muted-foreground">W</span>
+                    </div>
+                    <div className="text-[11px] text-muted-foreground uppercase tracking-wide mt-1">Power</div>
+                  </div>
+                  <div className="rounded-lg bg-muted/60 border border-border p-3.5">
+                    <div className="flex items-baseline gap-1.5">
+                      <span className="tnum text-[28px] font-extrabold leading-none tabular-nums">{pm.cadence ?? "--"}</span>
+                      <span className="text-[11px] font-bold text-muted-foreground">rpm</span>
+                    </div>
+                    <div className="text-[11px] text-muted-foreground uppercase tracking-wide mt-1 flex items-center gap-1">
+                      Cadence
+                      {pm.batteryPct != null && <span className="ml-auto inline-flex items-center gap-0.5 font-bold"><BatteryMedium size={11} />{pm.batteryPct}%</span>}
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+            {pm.status === "idle" && pm.error && pm.error !== "No device selected" && (
+              <div className="text-[11.5px] text-destructive mt-2">{pm.error}</div>
             )}
           </div>
 

@@ -9,7 +9,7 @@ import { StrideMark, StrideWordmark } from "@/components/app/brand";
 import { ActivityCard, PostCard, useUnits, AthleteRow } from "@/components/app/cards";
 import { SegmentedTabs, Avatar, EmptyState } from "@/components/app/ui";
 import { GoalRing } from "@/components/app/charts";
-import { fmtDist, distUnit, fmtDuration, fmtElev } from "@/lib/format";
+import { fmtDist, distUnit, fmtDuration, fmtElev, type Units } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 export function FeedScreen() {
@@ -96,7 +96,7 @@ export function FeedScreen() {
         <div className="px-4 pt-4">
           <div className="bg-card border border-border rounded-lg p-4 flex items-center gap-4">
             <GoalRing
-              progress={summary.data.goals.length ? summary.data.goals[0].currentM / (summary.data.goals[0].target * 1000) : 0}
+              progress={summary.data.goals.length ? summary.data.goals[0].current / Math.max(1, summary.data.goals[0].target) : 0}
               size={62}
             >
               <span className="tnum text-[15px] font-bold">{summary.data.week.activities}</span>
@@ -118,7 +118,7 @@ export function FeedScreen() {
               </div>
               {summary.data.goals.length > 0 && (
                 <div className="text-[11px] text-muted-foreground mt-1 truncate">
-                  {fmtDist(summary.data.goals[0].currentM, units, 1)} / {summary.data.goals[0].target} {distUnit(units)} {summary.data.goals[0].sport ?? "all"} goal
+                  {weeklyGoalLabel(summary.data.goals[0], units)}
                 </div>
               )}
             </div>
@@ -170,9 +170,16 @@ export function FeedScreen() {
   );
 }
 
+// goal values arrive in SI: metres, or seconds for time goals
+function weeklyGoalLabel(g: { metric: string; target: number; current: number; sport: string | null }, units: Units): string {
+  const fmt = (v: number) =>
+    g.metric === "time" ? fmtDuration(v, "compact") : g.metric === "elevation" ? fmtElev(v, units) : `${fmtDist(v, units, 1)} ${distUnit(units)}`;
+  return `${fmt(g.current)} / ${fmt(g.target)} ${g.sport ?? "all-sport"} goal`;
+}
+
 function SuggestedBlock({ athletes }: { athletes: any[] }) {
   const qc = useQueryClient();
-  const followMut = (id: string) => api.post(`athletes/${id}/follow`).then(() => qc.invalidateQueries({ queryKey: ["feed", "suggested"] }));
+  const followMut = (id: string) => api.post(`athletes/${id}/follow`, { on: true }).then(() => qc.invalidateQueries({ queryKey: ["feed", "suggested"] }));
   return (
     <div className="bg-card border border-border rounded-lg overflow-hidden">
       <div className="px-4 pt-3.5 pb-1 text-[13px] font-bold uppercase tracking-wider text-muted-foreground">You might know</div>

@@ -1,15 +1,23 @@
 import { db } from "@/lib/db";
 import { json, err } from "../session";
-import { activityCard, postCard } from "../transform";
-import { athleteStats, currentStreak, startOfWeek } from "../analytics";
+import { activityCard, postCard, athleteSummary } from "../transform";
+import { currentStreak, startOfWeek } from "../analytics";
+import { followingIdsOf, visibleTo } from "../visibility";
 
 // GET /api/feed?scope=following|you|clubs&before=<iso>
+// feed items sort by when they happened: activity start, or post creation
+type FeedItem = { type: "activity"; data: { startDate: string } } | { type: "post"; data: { createdAt: string } };
+const when = (it: FeedItem) => (it.type === "activity" ? it.data.startDate : it.data.createdAt);
+
 export async function feed(viewerId: string | null, url: URL): Promise<Response> {
   if (!viewerId) return err(401, "Sign in required");
   const scope = url.searchParams.get("scope") ?? "following";
   const before = url.searchParams.get("before") ? new Date(url.searchParams.get("before")!) : new Date();
   const take = 15;
 
+  if (Number.isNaN(before.getTime())) return err(400, "Bad cursor");
+
+  const following = await followingIdsOf(viewerId);
   let athleteIds: string[];
   if (scope === "you") {
     athleteIds = [viewerId];
@@ -21,11 +29,11 @@ export async function feed(viewerId: string | null, url: URL): Promise<Response>
     });
     athleteIds = [...new Set([viewerId, ...members.map((m) => m.athleteId)])];
   } else {
-    const following = await db.athleteFollow.findMany({ where: { followerId: viewerId }, select: { followedId: true } });
-    athleteIds = [viewerId, ...following.map((f) => f.followedId)];
+    athleteIds = [viewerId, ...following];
   }
 
-  const visibilityFilter = scope === "you" ? {} : { visibility: { in: ["everyone", "followers"] } };
+  // club members you don't follow only show you their public activities
+  const visibilityFilter = scope === "you" ? {} : visibleTo(viewerId, following);
 
   const [acts, posts] = await Promise.all([
     db.activity.findMany({
@@ -50,14 +58,10 @@ export async function feed(viewerId: string | null, url: URL): Promise<Response>
   const items = [
     ...(await Promise.all(acts.map((a) => activityCard(a, viewerId)))).map((a) => ({ type: "activity" as const, data: a })),
     ...(await Promise.all(posts.map((p) => postCard(p, viewerId)))).map((p) => ({ type: "post" as const, data: p })),
-  ].sort((x, y) => (x.data.startDate ?? (x.data as any).createdAt) < (y.data.startDate ?? (y.data as any).createdAt) ? 1 : -1);
+  ].sort((x, y) => (when(x) < when(y) ? 1 : -1));
 
   const page = items.slice(0, take);
-  const oldest = page.length
-    ? page[page.length - 1].type === "activity"
-      ? (page[page.length - 1].data as any).startDate
-      : (page[page.length - 1].data as any).createdAt
-    : null;
+  const oldest = page.length ? when(page[page.length - 1]) : null;
 
   return json({ items: page, nextCursor: oldest });
 }
@@ -71,14 +75,17 @@ export async function feedSummary(viewerId: string | null): Promise<Response> {
       where: { athleteId: viewerId, startDate: { gte: weekStart } },
       select: { distanceM: true, movingTimeS: true, elevationM: true, relativeEffort: true, sport: true },
     }),
-    db.goal.findMany({ where: { athleteId: viewerId, period: "weekly" } }),
+    db.goal.findMany({ where: { athleteId: viewerId, period: "weekly" }, orderBy: { createdAt: "asc" } }),
     currentStreak(viewerId),
   ]);
-  const perSport = new Map<string, number>();
-  for (const a of thisWeek) perSport.set(a.sport, (perSport.get(a.sport) ?? 0) + a.distanceM);
+  // goal targets and progress are SI: metres, or seconds for time goals
   const goalsOut = goals.map((g) => {
-    const current = g.sport ? (perSport.get(g.sport) ?? 0) : thisWeek.reduce((a, r) => a + r.distanceM, 0);
-    return { id: g.id, metric: g.metric, target: g.target, sport: g.sport, currentM: current };
+    const rows = g.sport ? thisWeek.filter((a) => a.sport === g.sport) : thisWeek;
+    const current =
+      g.metric === "time" ? rows.reduce((a, r) => a + r.movingTimeS, 0) :
+      g.metric === "elevation" ? rows.reduce((a, r) => a + r.elevationM, 0) :
+      rows.reduce((a, r) => a + r.distanceM, 0);
+    return { id: g.id, metric: g.metric, target: g.target, sport: g.sport, current };
   });
   return json({
     week: {
@@ -126,4 +133,53 @@ export async function suggestedAthletes(viewerId: string | null): Promise<Respon
       city: a.city, country: a.country, bio: a.bio, premium: a.premium, followerCount: a.followerCount,
     })),
   });
+}
+
+// POST /api/posts/:id/kudos { on?: boolean } — gives kudos (on: false takes it
+// back); repeating a request changes nothing
+export async function postKudos(id: string, viewerId: string | null, body: any): Promise<Response> {
+  if (!viewerId) return err(401, "Sign in required");
+  const post = await db.post.findUnique({ where: { id } });
+  if (!post) return err(404, "Post not found");
+  if (body?.on === false) {
+    await db.kudos.deleteMany({ where: { postId: post.id, athleteId: viewerId } });
+    return json({ hasKudos: false });
+  }
+  const { count } = await db.kudos.createMany({ data: [{ postId: post.id, athleteId: viewerId }], skipDuplicates: true });
+  if (count > 0 && post.athleteId !== viewerId) {
+    await db.notification.create({ data: { recipientId: post.athleteId, actorId: viewerId, type: "kudos", postId: post.id } });
+  }
+  return json({ hasKudos: true });
+}
+
+function commentOut(r: { id: string; text: string; createdAt: Date; athlete: Parameters<typeof athleteSummary>[0] }) {
+  const { followerCount: _f, followingCount: _g, ...athlete } = athleteSummary(r.athlete);
+  return { id: r.id, text: r.text, createdAt: r.createdAt.toISOString(), athlete };
+}
+
+// GET /api/posts/:id/comments
+export async function postComments(id: string): Promise<Response> {
+  const rows = await db.comment.findMany({
+    where: { postId: id },
+    include: { athlete: true },
+    orderBy: { createdAt: "asc" },
+  });
+  return json({ comments: rows.map(commentOut) });
+}
+
+// POST /api/posts/:id/comments
+export async function postComment(id: string, viewerId: string | null, body: any): Promise<Response> {
+  if (!viewerId) return err(401, "Sign in required");
+  const post = await db.post.findUnique({ where: { id } });
+  if (!post) return err(404, "Post not found");
+  const text = String(body?.text ?? "").trim();
+  if (!text) return err(400, "Comment text required");
+  const row = await db.comment.create({
+    data: { postId: post.id, athleteId: viewerId, text: text.slice(0, 500) },
+    include: { athlete: true },
+  });
+  if (post.athleteId !== viewerId) {
+    await db.notification.create({ data: { recipientId: post.athleteId, actorId: viewerId, type: "comment", postId: post.id } });
+  }
+  return json({ comment: commentOut(row) });
 }

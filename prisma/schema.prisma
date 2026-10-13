@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -54,7 +54,9 @@ model Athlete {
   adminOf       Club[]    @relation("clubAdmin")
   challengeEntries ChallengeEntry[]
   sessions      Session[]
+  passwordResets PasswordReset[]
   createdSegments Segment[] @relation("segmentCreator")
+  reports       Report[]
 }
 
 model AthleteFollow {
@@ -62,19 +64,29 @@ model AthleteFollow {
   followerId String
   followedId String
   createdAt  DateTime @default(now())
-  follower   Athlete  @relation("follower", fields: [followerId], references: [id])
-  followed   Athlete  @relation("followed", fields: [followedId], references: [id])
+  follower   Athlete  @relation("follower", fields: [followerId], references: [id], onDelete: Cascade)
+  followed   Athlete  @relation("followed", fields: [followedId], references: [id], onDelete: Cascade)
 
   @@unique([followerId, followedId])
 }
 
 model Session {
   id        String   @id @default(cuid())
-  token     String   @unique
+  tokenHash String   @unique // sha256 of the cookie token — the token itself is never stored
   athleteId String
   expiresAt DateTime
   createdAt DateTime @default(now())
-  athlete   Athlete  @relation(fields: [athleteId], references: [id])
+  athlete   Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+}
+
+model PasswordReset {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique // sha256 of the reset token — the token itself is never stored
+  athleteId String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  athlete   Athlete   @relation(fields: [athleteId], references: [id], onDelete: Cascade)
 }
 
 // ─── Activities ─────────────────────────────────────────────────────────────
@@ -82,7 +94,7 @@ model Session {
 model Activity {
   id              String   @id @default(cuid())
   athleteId       String
-  athlete         Athlete  @relation(fields: [athleteId], references: [id])
+  athlete         Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
   sport           String // "run" | "ride" | "trail_run" | "gravel" | "mtb" | "walk" | "hike" | "ebike" | "swim" | "row" | "ski" | "snowboard" | "kayak" | "workout" | "yoga" | "gym" | "tennis" | "football"
   title           String?
   description     String?
@@ -100,17 +112,21 @@ model Activity {
   maxSpeed        Float?
   avgHr           Int?
   maxHr           Int?
+  avgWatts        Int? // from a Bluetooth power meter
+  maxWatts        Int?
   calories        Int?
-  relativeEffort Int?
+  relativeEffort  Int?
+  effortSource    String? // how relativeEffort was derived: "hr" | "rpe" | "estimate"
   perceivedEffort Int? // 1..10
   visibility      String   @default("everyone") // "everyone" | "followers" | "only_me"
   isCommute       Boolean  @default(false)
   isTrainer       Boolean  @default(false) // indoor / no GPS
   gearId          String?
-  gear            Gear?    @relation(fields: [gearId], references: [id])
+  gear            Gear?    @relation(fields: [gearId], references: [id], onDelete: SetNull)
   photo           String?
   flagged         Boolean  @default(false)
   deviceName      String   @default("STRIDE App")
+  clientId        String? // set by the recorder; a retried upload with the same id returns the first save
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -120,6 +136,8 @@ model Activity {
   kudos    Kudos[]
   comments Comment[]
   efforts  SegmentEffort[]
+
+  @@unique([athleteId, clientId])
 }
 
 model Track {
@@ -127,6 +145,8 @@ model Track {
   activityId String   @unique
   points     String // JSON: [[lng, lat, ele, secs], ...]
   hrPoints   String? // JSON: [[t, hr], ...] — live Bluetooth heart-rate samples
+  powerPoints String? // JSON: [[t, watts], ...] — live Bluetooth power-meter samples
+  pauses     String? // JSON: [[tStart, tEnd], ...] — manual pauses; nothing is counted across them
   activity   Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
 }
 
@@ -163,7 +183,10 @@ model Kudos {
   createdAt  DateTime  @default(now())
   activity   Activity? @relation(fields: [activityId], references: [id], onDelete: Cascade)
   post       Post?     @relation(fields: [postId], references: [id], onDelete: Cascade)
-  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+  athlete    Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+
+  @@unique([activityId, athleteId])
+  @@unique([postId, athleteId])
 }
 
 model Comment {
@@ -175,7 +198,7 @@ model Comment {
   createdAt  DateTime  @default(now())
   activity   Activity? @relation(fields: [activityId], references: [id], onDelete: Cascade)
   post       Post?     @relation(fields: [postId], references: [id], onDelete: Cascade)
-  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+  athlete    Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
 }
 
 model Post {
@@ -185,7 +208,7 @@ model Post {
   photo      String?
   visibility String   @default("everyone")
   createdAt  DateTime @default(now())
-  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+  athlete    Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
   kudos      Kudos[]
   comments   Comment[]
 }
@@ -213,7 +236,7 @@ model Segment {
   endLng        Float
   starredCount  Int      @default(0)
   creatorId     String?
-  creator       Athlete? @relation("segmentCreator", fields: [creatorId], references: [id])
+  creator       Athlete? @relation("segmentCreator", fields: [creatorId], references: [id], onDelete: SetNull)
   createdAt     DateTime @default(now())
 
   efforts  SegmentEffort[]
@@ -226,7 +249,7 @@ model SegmentStar {
   athleteId  String
   createdAt  DateTime @default(now())
   segment    Segment  @relation(fields: [segmentId], references: [id], onDelete: Cascade)
-  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+  athlete    Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
 
   @@unique([segmentId, athleteId])
 }
@@ -243,7 +266,7 @@ model SegmentEffort {
   isPR       Boolean  @default(false)
   rank       Int? // rank on segment leaderboard at creation (1 = CR/KOM)
   segment    Segment  @relation(fields: [segmentId], references: [id], onDelete: Cascade)
-  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+  athlete    Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
   activity   Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
 
   @@index([segmentId, athleteId])
@@ -276,7 +299,7 @@ model ClubMembership {
   role      String   @default("member") // "owner" | "admin" | "member"
   joinedAt  DateTime @default(now())
   club      Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
-  athlete   Athlete  @relation(fields: [athleteId], references: [id])
+  athlete   Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
 
   @@unique([clubId, athleteId])
 }
@@ -303,7 +326,7 @@ model EventAttendance {
   status    String    @default("going") // "going" | "interested"
   createdAt DateTime  @default(now())
   event     ClubEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
-  athlete   Athlete  @relation(fields: [athleteId], references: [id])
+  athlete   Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
 
   @@unique([eventId, athleteId])
 }
@@ -337,7 +360,7 @@ model ChallengeEntry {
   joinedAt    DateTime  @default(now())
   completedAt DateTime?
   challenge   Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
-  athlete     Athlete  @relation(fields: [athleteId], references: [id])
+  athlete     Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
 
   @@unique([challengeId, athleteId])
 }
@@ -351,11 +374,11 @@ model Gear {
   name       String
   brand      String?
   model      String?
-  distanceM  Float    @default(0)
+  distanceM  Float    @default(0) // cache: sum of its activities, see refreshGearDistance
   retired    Boolean  @default(false)
   isDefault  Boolean  @default(false)
   createdAt  DateTime @default(now())
-  athlete    Athlete  @relation(fields: [athleteId], references: [id])
+  athlete    Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
   activities Activity[]
 }
 
@@ -363,11 +386,11 @@ model Goal {
   id        String   @id @default(cuid())
   athleteId String
   metric    String   @default("distance") // "distance" | "time" | "elevation"
-  target    Float // per period (km | minutes | m)
+  target    Float // per period, SI: metres (distance, elevation) or seconds (time)
   period    String   @default("weekly") // "weekly" | "monthly" | "yearly"
   sport     String? // null = all sports
   createdAt DateTime @default(now())
-  athlete   Athlete  @relation(fields: [athleteId], references: [id])
+  athlete   Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
 }
 
 model Route {
@@ -382,7 +405,7 @@ model Route {
   estimatedTimeS Int?
   isPublic      Boolean  @default(true)
   createdAt     DateTime @default(now())
-  athlete       Athlete  @relation(fields: [athleteId], references: [id])
+  athlete       Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
 }
 
 model Notification {
@@ -397,6 +420,26 @@ model Notification {
   text        String?
   read        Boolean  @default(false)
   createdAt   DateTime @default(now())
-  recipient   Athlete  @relation("recipient", fields: [recipientId], references: [id])
-  actor       Athlete? @relation("actor", fields: [actorId], references: [id])
+  recipient   Athlete  @relation("recipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  actor       Athlete? @relation("actor", fields: [actorId], references: [id], onDelete: Cascade)
+}
+
+// ─── Moderation ─────────────────────────────────────────────────────────────
+
+// A user's report of content or a person, reviewed by an operator. targetId is
+// not a foreign key so the report survives the content being deleted.
+model Report {
+  id         String    @id @default(cuid())
+  reporterId String
+  targetType String // "activity" | "post" | "comment" | "athlete" | "club"
+  targetId   String
+  reason     String // "spam" | "harassment" | "inappropriate" | "fake" | "privacy" | "other"
+  details    String?
+  status     String    @default("open") // "open" | "actioned" | "dismissed"
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+  reporter   Athlete   @relation(fields: [reporterId], references: [id], onDelete: Cascade)
+
+  @@unique([reporterId, targetType, targetId])
+  @@index([status, createdAt])
 }

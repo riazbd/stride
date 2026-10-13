@@ -1,6 +1,6 @@
 import { db } from "@/lib/db";
 import { json, err } from "../session";
-import { challengeProgress } from "../analytics";
+import { challengeProgress, evaluateChallenges } from "../analytics";
 
 // GET /api/challenges
 export async function listChallenges(viewerId: string | null): Promise<Response> {
@@ -8,11 +8,10 @@ export async function listChallenges(viewerId: string | null): Promise<Response>
   const joined = viewerId
     ? new Map((await db.challengeEntry.findMany({ where: { athleteId: viewerId } })).map((e) => [e.challengeId, e]))
     : new Map<string, any>();
-  const out = [];
-  for (const c of challenges) {
+  const out = await Promise.all(challenges.map(async (c) => {
     const entry = joined.get(c.id);
     const progress = entry ? await challengeProgress(viewerId!, c) : null;
-    out.push({
+    return {
       id: c.id, slug: c.slug, title: c.title, description: c.description,
       category: c.category, type: c.type, goalValue: c.goalValue, period: c.period,
       startDate: c.startDate.toISOString(), endDate: c.endDate.toISOString(),
@@ -22,8 +21,8 @@ export async function listChallenges(viewerId: string | null): Promise<Response>
       progress: progress !== null ? Math.min(progress, c.goalValue) : null,
       completedAt: entry?.completedAt?.toISOString() ?? null,
       daysLeft: Math.max(0, Math.ceil((c.endDate.getTime() - Date.now()) / 86400000)),
-    });
-  }
+    };
+  }));
   return json({ challenges: out });
 }
 
@@ -34,7 +33,7 @@ export async function getChallenge(slug: string, viewerId: string | null): Promi
   const entry = viewerId ? await db.challengeEntry.findUnique({ where: { challengeId_athleteId: { challengeId: c.id, athleteId: viewerId } } }) : null;
   const progress = entry ? await challengeProgress(viewerId!, c) : 0;
   // contributors: activities within window matching filter
-  const map: Record<string, string[]> = {
+  const map: Record<string, string[] | undefined> = {
     run: ["run", "trail_run"], ride: ["ride", "gravel", "mtb", "ebike", "virtual_ride"],
     walk: ["walk", "hike"], yoga: ["yoga"], general: undefined,
   };
@@ -50,10 +49,6 @@ export async function getChallenge(slug: string, viewerId: string | null): Promi
         take: 20,
       })
     : [];
-  const topParticipants = await db.challengeEntry.findMany({
-    where: { challengeId: c.id },
-    take: 1,
-  });
   return json({
     challenge: {
       id: c.id, slug: c.slug, title: c.title, description: c.description,
@@ -79,17 +74,15 @@ export async function joinChallenge(slug: string, viewerId: string | null, body:
   if (!viewerId) return err(401, "Sign in required");
   const c = await db.challenge.findUnique({ where: { slug } });
   if (!c) return err(404, "Challenge not found");
-  const existing = await db.challengeEntry.findUnique({ where: { challengeId_athleteId: { challengeId: c.id, athleteId: viewerId } } });
-  if (body?.action === "leave") {
-    if (existing) {
-      await db.challengeEntry.delete({ where: { id: existing.id } });
-      await db.challenge.update({ where: { id: c.id }, data: { joinedCount: { decrement: 1 } } });
-    }
-    return json({ isJoined: false });
-  }
-  if (!existing) {
-    await db.challengeEntry.create({ data: { challengeId: c.id, athleteId: viewerId } });
-    await db.challenge.update({ where: { id: c.id }, data: { joinedCount: { increment: 1 } } });
-  }
-  return json({ isJoined: true });
+  const key = { challengeId: c.id, athleteId: viewerId };
+  const leave = body?.action === "leave";
+  if (!leave && c.endDate.getTime() < Date.now()) return err(400, "This challenge has ended");
+  await db.$transaction(async (tx) => {
+    if (leave) await tx.challengeEntry.deleteMany({ where: key });
+    else await tx.challengeEntry.createMany({ data: [key], skipDuplicates: true });
+    await tx.challenge.update({ where: { id: c.id }, data: { joinedCount: await tx.challengeEntry.count({ where: { challengeId: c.id } }) } });
+  });
+  // activities already logged this month may finish it straight away
+  const completed = leave ? [] : await evaluateChallenges(viewerId);
+  return json({ isJoined: !leave, completed: completed.includes(c.slug) });
 }

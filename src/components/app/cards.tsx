@@ -1,6 +1,6 @@
 "use client";
 import React from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { ThumbsUp, MessageCircle, MoreHorizontal, MapPin, ChevronRight } from "lucide-react";
 import { api, Activity, PostItem, Athlete } from "@/lib/api";
 import { useNav, useUI } from "@/lib/nav";
@@ -33,6 +33,38 @@ export function ActivityStatsRow({ a, className, compact }: { a: Activity; class
   );
 }
 
+// Optimistic kudos: the same activity or post can sit in many caches at once
+// (feed pages, a profile, a club, its own detail screen), so walk every cached
+// query and update each copy carrying this id.
+function markKudos(qc: QueryClient, id: string, has: boolean) {
+  const patch = (v: any): any => {
+    if (Array.isArray(v)) {
+      let changed = false;
+      const out = v.map((x) => {
+        const y = patch(x);
+        if (y !== x) changed = true;
+        return y;
+      });
+      return changed ? out : v;
+    }
+    if (!v || typeof v !== "object") return v;
+    if (v.id === id && typeof v.hasKudos === "boolean") {
+      if (v.hasKudos === has) return v;
+      return { ...v, hasKudos: has, kudosCount: Math.max(0, (v.kudosCount ?? 0) + (has ? 1 : -1)) };
+    }
+    let changed = false;
+    const out: any = {};
+    for (const k of Object.keys(v)) {
+      out[k] = patch(v[k]);
+      if (out[k] !== v[k]) changed = true;
+    }
+    return changed ? out : v;
+  };
+  for (const q of qc.getQueryCache().getAll()) {
+    if (q.state.data !== undefined) qc.setQueryData(q.queryKey, patch(q.state.data));
+  }
+}
+
 export function ActivityCard({ activity: a, showDescription = true }: { activity: Activity; showDescription?: boolean }) {
   const nav = useNav();
   const qc = useQueryClient();
@@ -41,27 +73,12 @@ export function ActivityCard({ activity: a, showDescription = true }: { activity
   const def = sportOf(a.sport);
 
   const kudosMut = useMutation({
-    mutationFn: () => api.post(`activities/${a.id}/kudos`),
-    onMutate: async () => {
-      const keys = qc.getQueryCache().findAll({ queryKey: ["feed"] });
-      for (const k of keys) {
-        qc.setQueryData<any>(k.queryKey, (old: any) => {
-          if (!old?.items) return old;
-          return {
-            ...old,
-            items: old.items.map((it: any) =>
-              it.type === "activity" && it.data.id === a.id
-                ? { ...it, data: { ...it.data, hasKudos: !a.hasKudos, kudosCount: it.data.kudosCount + (a.hasKudos ? -1 : 1) } }
-                : it
-            ),
-          };
-        });
-      }
-      qc.setQueryData<any>(["activity", a.id], (old: any) =>
-        old ? { ...old, activity: { ...old.activity, hasKudos: !a.hasKudos, kudosCount: (old.activity.kudosCount ?? 0) + (a.hasKudos ? -1 : 1) } } : old
-      );
+    mutationFn: () => api.post(`activities/${a.id}/kudos`, { on: true }),
+    onMutate: () => markKudos(qc, a.id, true),
+    onError: () => {
+      markKudos(qc, a.id, false);
+      toast({ description: "Couldn't give kudos — try again" });
     },
-    onError: () => toast({ description: "Couldn't give kudos — try again" }),
   });
 
   const openComments = () => nav.openSheet({ k: "commentBox", target: { activityId: a.id } });
@@ -156,23 +173,13 @@ export function ActivityCard({ activity: a, showDescription = true }: { activity
 export function PostCard({ post: p }: { post: PostItem }) {
   const nav = useNav();
   const qc = useQueryClient();
+  const { toast } = useToast();
   const kudosMut = useMutation({
-    mutationFn: () => api.post(`posts/${p.id}/kudos`),
-    onMutate: async () => {
-      const keys = qc.getQueryCache().findAll({ queryKey: ["feed"] });
-      for (const k of keys) {
-        qc.setQueryData<any>(k.queryKey, (old: any) => {
-          if (!old?.items) return old;
-          return {
-            ...old,
-            items: old.items.map((it: any) =>
-              it.type === "post" && it.data.id === p.id
-                ? { ...it, data: { ...it.data, hasKudos: !p.hasKudos, kudosCount: it.data.kudosCount + (p.hasKudos ? -1 : 1) } }
-                : it
-            ),
-          };
-        });
-      }
+    mutationFn: () => api.post(`posts/${p.id}/kudos`, { on: true }),
+    onMutate: () => markKudos(qc, p.id, true),
+    onError: () => {
+      markKudos(qc, p.id, false);
+      toast({ description: "Couldn't give kudos — try again" });
     },
   });
   return (
