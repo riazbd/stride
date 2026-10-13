@@ -1,9 +1,10 @@
 "use client";
 import React, { useState } from "react";
 import { motion } from "framer-motion";
-import { ChevronDown, Pause, Play, Trash2, Flag, Satellite, ChevronUp } from "lucide-react";
-import { useNav } from "@/lib/nav";
+import { ChevronDown, Pause, Play, Trash2, Flag, Satellite, ChevronUp, HeartPulse } from "lucide-react";
+import { useNav, useUI } from "@/lib/nav";
 import { useRecorder } from "@/lib/recorder";
+import { useSensors, ZONE_COLORS, ZONE_NAMES, hrZoneIndex } from "@/lib/sensors";
 import { MapView } from "@/components/app/MapView";
 import { sportOf } from "@/lib/sports";
 import { fmtDist, fmtDuration, fmtPace, MI } from "@/lib/format";
@@ -15,6 +16,9 @@ export function RecordingScreen() {
   const rec = useRecorder();
   const nav = useNav();
   const units = useUnits();
+  const hrm = useSensors((s) => s.hrm);
+  const maxHr = useUI((s) => s.me?.maxHr) ?? 190;
+  const hrZone = hrm.hr && hrm.status === "connected" ? hrZoneIndex(hrm.hr, maxHr) : null;
   const [mapExpanded, setMapExpanded] = useState(false);
   const def = sportOf(rec.sport);
   const paceMode = def.paceMode;
@@ -67,6 +71,12 @@ export function RecordingScreen() {
             <Satellite size={13} className={rec.gpsStatus === "ok" ? "text-achievement" : "text-trophy"} />
             <span className="text-[11px] font-bold">{rec.gpsStatus === "ok" ? `±${rec.gpsAccuracy}m` : rec.gpsStatus === "searching" ? "GPS…" : "no GPS"}</span>
           </div>
+          {hrm.status === "connected" && (
+            <div className="h-9 flex items-center gap-1.5 px-3 rounded-full bg-background/90 backdrop-blur border border-border shadow-sm">
+              <HeartPulse size={13} style={{ color: hrZone != null ? ZONE_COLORS[hrZone] : "#fc4c02" }} fill="currentColor" />
+              <span className="tnum text-[11px] font-bold">{hrm.hr ?? "--"} bpm</span>
+            </div>
+          )}
           {rec.autoPaused && (
             <div className="h-9 flex items-center px-3 rounded-full bg-trophy/90 text-background text-[11px] font-bold shadow-sm animate-pulse">
               AUTO-PAUSED
@@ -114,7 +124,17 @@ export function RecordingScreen() {
             </>
           )}
           <Metric label="Elevation" value={String(Math.round(rec.elevationM))} sub="m gain" />
-          <Metric label="Last split" value={lastSplit ? fmtPace(lastSplit.timeS / Math.max(1, lastSplit.distanceM / 1000), false) : "--:--"} sub={`/${units === "km" ? "km" : "mi"}`} />
+          {hrm.status === "connected" ? (
+            <div>
+              <div className="tnum text-[22px] font-bold leading-none flex items-baseline gap-1" style={{ color: hrZone != null ? ZONE_COLORS[hrZone] : undefined }}>
+                {hrm.hr ?? "--"}
+                <span className="text-[11px] font-semibold text-muted-foreground">bpm{hrZone != null ? ` · Z${hrZone + 1} ${ZONE_NAMES[hrZone]}` : ""}</span>
+              </div>
+              <div className="text-[11px] text-muted-foreground uppercase tracking-wide mt-1">Heart rate</div>
+            </div>
+          ) : (
+            <Metric label="Last split" value={lastSplit ? fmtPace(lastSplit.timeS / Math.max(1, lastSplit.distanceM / 1000), false) : "--:--"} sub={`/${units === "km" ? "km" : "mi"}`} />
+          )}
         </div>
 
         {/* split flash */}

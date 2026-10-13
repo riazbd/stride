@@ -32,6 +32,7 @@ export type Screen =
   | { k: "notifications" }
   | { k: "search" }
   | { k: "settings" }
+  | { k: "devices" }
   | { k: "premium"; feature?: string }
   | { k: "privacy" }
   | { k: "about" };

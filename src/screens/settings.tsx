@@ -5,6 +5,7 @@ import { Ruler, Globe, ShieldCheck, Palette, LogOut, Info, ChevronRight, Watch, 
 import { useQueryClient } from "@tanstack/react-query";
 import { useNav, useUI } from "@/lib/nav";
 import { api } from "@/lib/api";
+import { useSensors } from "@/lib/sensors";
 import { ScreenHeader } from "@/components/app/shell";
 import { ListRow } from "@/components/app/ui";
 import { useToast } from "@/hooks/use-toast";
@@ -24,6 +25,8 @@ export function SettingsScreen() {
   const [units, setUnits] = useState<"km" | "mi">((me?.units as "km" | "mi") ?? "km");
   const [pwSheet, setPwSheet] = useState(false);
   const [delSheet, setDelSheet] = useState(false);
+  // only the connection statuses — avoids re-rendering settings on every heartbeat
+  const sensorState = useSensors((s) => `${s.hrm.status}/${s.csc.status}`);
 
   const patch = async (body: any) => {
     try {
@@ -122,7 +125,20 @@ export function SettingsScreen() {
         {/* apps */}
         <Section title="Apps & services">
           <div className="bg-card border border-border rounded-lg overflow-hidden">
-            <ListRow left={<Watch size={18} className="text-muted-foreground" />} title="Connected devices" sub="Garmin · Apple Watch · Wahoo" chevron onClick={() => toast({ description: "Device sync coming soon in this demo" })} />
+            <ListRow
+              left={<Watch size={18} className="text-muted-foreground" />}
+              title="Connected devices"
+              sub={
+                <span className="flex items-center gap-1.5">
+                  {sensorState.includes("connected") && <span className="w-1.5 h-1.5 rounded-full bg-achievement" />}
+                  {sensorState.includes("connected")
+                    ? "Sensors connected — manage them"
+                    : "Bluetooth HR straps · speed & cadence · file import"}
+                </span>
+              }
+              chevron
+              onClick={() => nav.push({ k: "devices" })}
+            />
           </div>
         </Section>
 

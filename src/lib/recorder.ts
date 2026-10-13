@@ -29,6 +29,7 @@ export interface RecDraft {
   startDate: string;
   avgHr: number | null;
   maxHr: number | null;
+  hrSeries: [number, number][] | null; // [t, hr] samples from a live sensor
 }
 
 type GPSStatus = "off" | "searching" | "ok" | "weak";
@@ -54,6 +55,8 @@ interface RecorderState {
   _timer: any;
   _watch: number | null;
   _wakeLock: any;
+  _hrSamples: { t: number; hr: number }[];
+  noteHr: (hr: number) => void;
   _pauseAccumMs: number;
   _lastTickMs: number;
   _lastMoveAtMs: number;
@@ -129,6 +132,21 @@ export const useRecorder = create<RecorderState>((set, get) => ({
   _timer: null,
   _watch: null,
   _wakeLock: null,
+  _hrSamples: [],
+
+  // called by the sensors store on every Bluetooth HR notification
+  noteHr: (hr) => {
+    const st = useRecorder.getState();
+    if (st.state === "idle" || st.state === "finished") return;
+    const t = Math.max(0, Math.round(((st.startDate ? Date.now() - st.startDate - st._pauseAccumMs : 0) / 1000) * 10) / 10);
+    const prev = st._hrSamples[st._hrSamples.length - 1];
+    if (prev && prev.t === t) {
+      // same tenth-second — keep the freshest reading
+      useRecorder.setState({ _hrSamples: [...st._hrSamples.slice(0, -1), { t, hr }] });
+      return;
+    }
+    useRecorder.setState({ _hrSamples: [...st._hrSamples, { t, hr }] });
+  },
   _pauseAccumMs: 0,
   _lastTickMs: 0,
   _lastMoveAtMs: 0,
@@ -143,7 +161,7 @@ export const useRecorder = create<RecorderState>((set, get) => ({
       startDate: now, elapsedMs: 0, movingMs: 0, distanceM: 0, elevationM: 0,
       currentSpeed: 0, gpsStatus: "searching", gpsAccuracy: null,
       autoPause, autoPaused: false,
-      _pauseAccumMs: 0, _lastMoveAtMs: now, _eleHistory: [], _prevSplitTimeS: 0,
+      _pauseAccumMs: 0, _lastMoveAtMs: now, _eleHistory: [], _prevSplitTimeS: 0, _hrSamples: [],
     });
 
     const nav: any = navigator;
@@ -305,6 +323,11 @@ export const useRecorder = create<RecorderState>((set, get) => ({
         s.paceZone = Math.max(-3, Math.min(3, Math.round(((med - s.timeS / Math.max(1, s.distanceM)) / med) * 10)));
       }
     }
+    // live heart-rate stats from a connected Bluetooth strap
+    const samples = st._hrSamples;
+    const avgHr = samples.length >= 8 ? Math.round(samples.reduce((a, b) => a + b.hr, 0) / samples.length) : null;
+    const maxHr = samples.length >= 8 ? Math.max(...samples.map((s) => s.hr)) : null;
+    const hrSeries = samples.length >= 8 ? samples.map((s) => [s.t, s.hr] as [number, number]) : null;
     return {
       sport: st.sport,
       points: st.points.map((p) => [p.lng, p.lat, p.ele, p.t]),
@@ -315,8 +338,9 @@ export const useRecorder = create<RecorderState>((set, get) => ({
       splits,
       laps: st.laps,
       startDate: new Date(st.startDate ?? Date.now()).toISOString(),
-      avgHr: null,
-      maxHr: null,
+      avgHr,
+      maxHr,
+      hrSeries,
     };
   },
 
@@ -326,7 +350,7 @@ export const useRecorder = create<RecorderState>((set, get) => ({
       state: "idle", points: [], splits: [], laps: [], startDate: null,
       elapsedMs: 0, movingMs: 0, distanceM: 0, elevationM: 0, currentSpeed: 0,
       gpsStatus: "off", gpsAccuracy: null, autoPaused: false,
-      _pauseAccumMs: 0, _eleHistory: [], _prevSplitTimeS: 0, _timer: null, _watch: null,
+      _pauseAccumMs: 0, _eleHistory: [], _prevSplitTimeS: 0, _timer: null, _watch: null, _hrSamples: [],
       finishedDraft: null, lastSplitAt: 0,
     });
   },

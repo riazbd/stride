@@ -1,12 +1,13 @@
 /* STRIDE service worker — offline app shell + map tile caching.
  * Strategies:
  *   - navigation requests: network-first, cache fallback, offline.html last
- *   - static assets (/_next/static, /brand, /icons, images, fonts): cache-first
+ *   - static assets (/_next/static, /brand, /icons, images, fonts): network-first,
+ *     cached copy as offline fallback (dev-safe: chunk URLs aren't content-hashed)
  *   - map tiles (ArcGIS): stale-while-revalidate (bounded LRU-ish trim)
  *   - session check (/api/auth/me): network-first with offline fallback
  *   - /api/* (other): pass through to the network (never cached)
  */
-const VERSION = "stride-v2";
+const VERSION = "stride-v3";
 const SHELL_CACHE = `${VERSION}-shell`;
 const ASSET_CACHE = `${VERSION}-assets`;
 const TILE_CACHE = `${VERSION}-tiles`;
@@ -109,12 +110,13 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // same-origin static assets: cache-first
+  // same-origin static assets: network-first, cache fallback (offline).
+  // NOT cache-first: dev chunk URLs aren't content-hashed, so cache-first
+  // would forever serve stale JS after a rebuild.
   if (isStaticAsset(url)) {
     event.respondWith(
       caches.open(ASSET_CACHE).then(async (cache) => {
         const cached = await cache.match(req);
-        if (cached) return cached;
         try {
           const res = await fetch(req);
           if (res.ok) cache.put(req, res.clone());

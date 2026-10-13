@@ -126,6 +126,7 @@ model Track {
   id         String   @id @default(cuid())
   activityId String   @unique
   points     String // JSON: [[lng, lat, ele, secs], ...]
+  hrPoints   String? // JSON: [[t, hr], ...] — live Bluetooth heart-rate samples
   activity   Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
 }
 

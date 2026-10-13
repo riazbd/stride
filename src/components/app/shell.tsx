@@ -167,6 +167,7 @@ import { RecordingScreen } from "@/screens/recording";
 import { SaveActivityScreen } from "@/screens/save-activity";
 import { ManualActivityScreen } from "@/screens/manual";
 import { ImportGpxScreen } from "@/screens/import-gpx";
+import { DevicesScreen } from "@/screens/devices";
 import { SegmentsScreen } from "@/screens/segments";
 import { SegmentScreen } from "@/screens/segment";
 import { MapsScreen } from "@/screens/maps";
@@ -223,6 +224,7 @@ function renderScreen(s: Screen): React.ReactNode {
     case "notifications": return <NotificationsScreen />;
     case "search": return <SearchScreen />;
     case "settings": return <SettingsScreen />;
+    case "devices": return <DevicesScreen />;
     case "postComposer": return <PostComposerScreen />;
     case "premium": return <PaywallScreen feature={s.feature} />;
     case "privacy": return <PrivacyScreen />;

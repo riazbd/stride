@@ -5,6 +5,7 @@ import { Loader2, Check } from "lucide-react";
 import { api } from "@/lib/api";
 import { useNav } from "@/lib/nav";
 import { useRecorder } from "@/lib/recorder";
+import { useSensors } from "@/lib/sensors";
 import { ScreenHeader } from "@/components/app/shell";
 import { RouteThumb } from "@/components/app/charts";
 import { SportIcon, SegmentedTabs } from "@/components/app/ui";
@@ -37,6 +38,7 @@ export function SaveActivityScreen() {
   const qc = useQueryClient();
   const units = useUnits();
   const { toast } = useToast();
+  const hrm = useSensors((s) => s.hrm);
   const draft = rec.finishedDraft;
   const def = sportOf(draft?.sport ?? "run");
   const [sport, setSport] = useState(draft?.sport ?? "run");
@@ -68,7 +70,10 @@ export function SaveActivityScreen() {
         isCommute,
         perceivedEffort: perceived,
         tzOffsetMin: -new Date().getTimezoneOffset(),
-        deviceName: "STRIDE App",
+        avgHr: draft?.avgHr ?? null,
+        maxHr: draft?.maxHr ?? null,
+        hrSeries: draft?.hrSeries ?? null,
+        deviceName: draft?.hrSeries ? `STRIDE App${hrm.name ? ` + ${hrm.name}` : " + HR strap"}` : "STRIDE App",
       }),
     onSuccess: async (res) => {
       rec.discard();

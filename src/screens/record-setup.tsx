@@ -1,8 +1,9 @@
 "use client";
 import React, { useState } from "react";
-import { Satellite, ChevronDown, Plus, FileUp, Watch } from "lucide-react";
+import { Satellite, ChevronDown, Plus, FileUp, Watch, HeartPulse, ChevronRight } from "lucide-react";
 import { useNav } from "@/lib/nav";
 import { useRecorder } from "@/lib/recorder";
+import { useSensors } from "@/lib/sensors";
 import { ScreenHeader } from "@/components/app/shell";
 import { SportIcon, SegmentedTabs } from "@/components/app/ui";
 import { RECORD_SPORTS, sportOf } from "@/lib/sports";
@@ -23,6 +24,9 @@ export function RecordSetupScreen() {
   const [cat, setCat] = useState("run");
   const [sport, setSport] = useState("run");
   const [autoPause, setAutoPause] = useState(true);
+  const hrm = useSensors((s) => s.hrm);
+  const csc = useSensors((s) => s.csc);
+  const sensorsOn = hrm.status === "connected" || csc.status === "connected";
   const active = rec.state !== "idle";
 
   const gpsColor =
@@ -117,6 +121,25 @@ export function RecordSetupScreen() {
               <span className={cn("absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all", autoPause ? "left-[22px]" : "left-0.5")} />
             </button>
           </div>
+
+          {/* sensors */}
+          <button
+            onClick={() => nav.push({ k: "devices" })}
+            className="border-t border-border px-4 py-3 flex items-center gap-3 w-full text-left active:bg-muted transition-colors"
+          >
+            <HeartPulse size={17} className={sensorsOn ? "text-achievement" : "text-muted-foreground"} />
+            <div className="flex-1 min-w-0">
+              <div className="text-[13.5px] font-semibold">Sensors</div>
+              <div className="text-[11.5px] text-muted-foreground truncate">
+                {hrm.status === "connected"
+                  ? `${hrm.name ?? "Heart-rate strap"} · ${hrm.hr ?? "--"} bpm`
+                  : csc.status === "connected"
+                    ? `${csc.name ?? "Speed & cadence"} · live`
+                    : "Connect HR strap & cycling sensors"}
+              </div>
+            </div>
+            {sensorsOn ? <span className="w-2 h-2 rounded-full bg-achievement shrink-0" /> : <ChevronRight size={15} className="text-muted-foreground shrink-0" />}
+          </button>
         </div>
       </div>
 

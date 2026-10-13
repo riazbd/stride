@@ -146,6 +146,30 @@ export async function analysis(id: string, viewerId: string | null): Promise<Res
   const ownerMaxHr = viewer?.maxHr ?? 190;
   if (!act.track) return json({ hasTrack: false, splits: [], laps: [], isPremium });
   const pts = decodeTrack(act.track.points);
+  // real Bluetooth HR series (recorded live from a paired strap) takes
+  // precedence over the effort-scaled simulation below
+  const hrRaw: [number, number][] | null = act.track.hrPoints
+    ? (() => {
+        try {
+          const v = JSON.parse(act.track.hrPoints!);
+          if (!Array.isArray(v) || v.length < 2) return null;
+          const clean = v
+            .filter((x: any) => Array.isArray(x) && Number.isFinite(+x[0]) && Number.isFinite(+x[1]))
+            .map((x: any) => [+x[0], Math.round(+x[1])] as [number, number]);
+          return clean.length >= 2 ? clean : null;
+        } catch { return null; }
+      })()
+    : null;
+  let hrPtr = 0;
+  const hrAt = (t: number): number | null => {
+    if (!hrRaw) return null;
+    while (hrPtr < hrRaw.length - 1 && hrRaw[hrPtr + 1][0] < t) hrPtr++;
+    const a = hrRaw[hrPtr];
+    const b = hrRaw[Math.min(hrPtr + 1, hrRaw.length - 1)];
+    if (t <= a[0]) return a[1];
+    if (b[0] <= a[0] || t >= b[0]) return b[1];
+    return Math.round(a[1] + ((b[1] - a[1]) * (t - a[0])) / (b[0] - a[0]));
+  };
   // rolling 30s pace + elevation + HR series (deterministic HR from speed + seed)
   const rng = mulberry32(hashString(act.id));
   const hrDrift = 0.9 + rng() * 0.2;
@@ -186,9 +210,10 @@ export async function analysis(id: string, viewerId: string | null): Promise<Res
     const targetHr = act.avgHr ?? 150;
     const vRef = Math.max(0.1, act.avgSpeed ?? 3);
     const vRatio = vAvg / vRef;
-    const hr = Math.round(
+    const hrSim = Math.round(
       Math.min(act.maxHr ?? ownerMaxHr, Math.max(70, restHr + (targetHr - restHr) * Math.min(1.25, Math.max(0.3, vRatio * 1.05)) + (rng() - 0.5) * 14))
     );
+    const hr = hrAt(pts[i].t) ?? hrSim;
     // grade-adjusted pace (GAP) — premium only
     let gap: number | null = null;
     if (isPaceSport && isPremium && i > 0) {
@@ -251,6 +276,65 @@ export async function analysis(id: string, viewerId: string | null): Promise<Res
   });
 }
 
+// ── live heart-rate series helpers ────────────────────────────────────────────
+// client sends [[t, hr], ...] from a connected Bluetooth strap; sanitize + compress
+function sanitizeHrSeries(raw: any): [number, number][] | null {
+  if (!Array.isArray(raw) || raw.length < 8) return null;
+  const clean: [number, number][] = [];
+  for (const x of raw) {
+    if (!Array.isArray(x) || x.length < 2) continue;
+    const t = +x[0]; const hr = Math.round(+x[1]);
+    if (!Number.isFinite(t) || t < 0 || !Number.isFinite(hr) || hr < 25 || hr > 255) continue;
+    const tR = Math.round(t * 10) / 10;
+    const last = clean[clean.length - 1];
+    if (last && tR === last[0]) last[1] = hr; // same tick — keep freshest
+    else if (!last || tR > last[0]) clean.push([tR, hr]);
+  }
+  if (clean.length < 8) return null;
+  if (clean.length > 4000) { // downsample, keep endpoints
+    const step = clean.length / 4000;
+    const out: [number, number][] = [];
+    for (let i = 0; i < 4000; i++) out.push(clean[Math.floor(i * step)]);
+    if (out[out.length - 1][0] < clean[clean.length - 1][0]) out.push(clean[clean.length - 1]);
+    return out;
+  }
+  return clean;
+}
+
+// mean HR inside a time window [t0, t1] of an [[t, hr]] series
+function hrMeanInWindow(series: [number, number][], t0: number, t1: number): number | null {
+  let sum = 0; let n = 0;
+  for (const [t, hr] of series) {
+    if (t < t0) continue;
+    if (t > t1) break;
+    sum += hr; n++;
+  }
+  return n ? Math.round(sum / n) : null;
+}
+
+// per-split avgHr: walk the track like computeSplits (SPEED_EPS = 0.55) and
+// note the elapsed time at each km boundary, then average the HR window
+function splitAvgHrs(pts: TrackPoint[], series: [number, number][], unitM = 1000): (number | null)[] {
+  const out: (number | null)[] = [];
+  let acc = 0;
+  let prevBoundaryT = 0;
+  let idx = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const d = haversineM([pts[i - 1].lng, pts[i - 1].lat], [pts[i].lng, pts[i].lat]);
+    const dt = pts[i].t - pts[i - 1].t;
+    if (dt > 0) {
+      const v = d / dt;
+      if (v > 0.55) acc += d;
+      if (acc >= (idx + 1) * unitM) {
+        out.push(hrMeanInWindow(series, prevBoundaryT, pts[i].t));
+        prevBoundaryT = pts[i].t;
+        idx++;
+      }
+    }
+  }
+  return out; // one entry per full km split, in order
+}
+
 // POST /api/activities — save a recorded or manual activity
 export async function createActivity(viewerId: string | null, body: any): Promise<Response> {
   if (!viewerId) return err(401, "Sign in required");
@@ -265,6 +349,11 @@ export async function createActivity(viewerId: string | null, body: any): Promis
   let splits: ReturnType<typeof computeSplits> = [];
   let avgHr: number | null = b.avgHr ? Math.round(b.avgHr) : null;
   let maxHr: number | null = b.maxHr ? Math.round(b.maxHr) : null;
+  let hrSeries: [number, number][] | null = sanitizeHrSeries(b.hrSeries); // real Bluetooth data wins
+  if (hrSeries) {
+    avgHr = Math.round(hrSeries.reduce((a, x) => a + x[1], 0) / hrSeries.length);
+    maxHr = Math.max(...hrSeries.map((x) => x[1]));
+  }
 
   if (trackRaw && trackRaw.length > 1) {
     points = trackRaw.map((p: number[]) => ({ lng: p[0], lat: p[1], ele: p[2] ?? 0, t: p[3] ?? 0 }));
@@ -296,6 +385,7 @@ export async function createActivity(viewerId: string | null, body: any): Promis
   const movingH = stats.movingS / 3600;
   const calories = Math.round((MET[sport] ?? 5) * (me?.weightKg ?? 70) * movingH * 1.05);
   const relEffort = b.relativeEffort ?? Math.round(Math.max(1, ((avgHr ?? 150) - 100) / 90 * movingH * 220));
+  const splitHrs = hrSeries && points ? splitAvgHrs(points, hrSeries) : [];
 
   const act = await db.activity.create({
     data: {
@@ -325,11 +415,12 @@ export async function createActivity(viewerId: string | null, body: any): Promis
       gearId: b.gearId || null,
       photo: b.photo || null,
       deviceName: b.deviceName ? String(b.deviceName) : "STRIDE App",
-      track: points ? { create: { points: JSON.stringify(points.map((p) => [p.lng, p.lat, p.ele, p.t])) } } : undefined,
+      track: points ? { create: { points: JSON.stringify(points.map((p) => [p.lng, p.lat, p.ele, p.t])), hrPoints: hrSeries ? JSON.stringify(hrSeries) : null } } : undefined,
       splits: {
-        create: splits.map((s) => ({
+        create: splits.map((s, i) => ({
           index: s.index, distanceM: s.distanceM, timeS: Math.round(s.timeS),
           elevationDiff: Math.round(s.elevationDiff), paceZone: s.paceZone,
+          avgHr: splitHrs[i] ?? null,
         })),
       },
       laps: Array.isArray(b.laps)
@@ -497,18 +588,39 @@ export async function exportGpx(id: string, viewerId: string | null): Promise<Re
   const esc = (s: string) => s.replace(/[<>&'"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" }[c] as string));
   const name = esc(act.title ?? `${act.sport.replace(/_/g, " ")} activity`);
   const iso = (t: number) => new Date(startMs + t * 1000).toISOString();
+  // include live heart rate per point (Garmin TrackPointExtension) when we have it
+  let hrRaw: [number, number][] | null = null;
+  if (act.track.hrPoints) {
+    try {
+      const v = JSON.parse(act.track.hrPoints!);
+      if (Array.isArray(v) && v.length >= 2) hrRaw = v.filter((x: any) => Array.isArray(x) && Number.isFinite(+x[0]) && Number.isFinite(+x[1]));
+    } catch { /* ignore */ }
+  }
+  let hp = 0;
+  const hrAt = (t: number): number | null => {
+    if (!hrRaw) return null;
+    while (hp < hrRaw.length - 1 && hrRaw[hp + 1][0] < t) hp++;
+    const a = hrRaw[hp];
+    const b = hrRaw[Math.min(hp + 1, hrRaw.length - 1)];
+    if (t <= a[0]) return a[1];
+    if (b[0] <= a[0] || t >= b[0]) return b[1];
+    return Math.round(a[1] + ((b[1] - a[1]) * (t - a[0])) / (b[0] - a[0]));
+  };
   const rows = track
-    .map(
-      (p) =>
+    .map((p) => {
+      const hr = hrAt(p.t);
+      return (
         `      <trkpt lat="${p.lat.toFixed(6)}" lon="${p.lng.toFixed(6)}">` +
         `<ele>${p.ele.toFixed(1)}</ele>` +
         `<time>${iso(p.t)}</time>` +
+        (hr != null ? `<extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>${hr}</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions>` : "") +
         `</trkpt>`
-    )
+      );
+    })
     .join("\n");
   const xml =
     `<?xml version="1.0" encoding="UTF-8"?>\n` +
-    `<gpx version="1.1" creator="STRIDE" xmlns="http://www.topografix.com/GPX/1/1">\n` +
+    `<gpx version="1.1" creator="STRIDE" xmlns="http://www.topografix.com/GPX/1/1" xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v1">\n` +
     `  <metadata>\n    <name>${name}</name>\n    <time>${track[0].t ? iso(track[0].t) : new Date(startMs).toISOString()}</time>\n  </metadata>\n` +
     `  <trk>\n    <name>${name}</name>\n    <type>${act.sport}</type>\n    <trkseg>\n${rows}\n    </trkseg>\n  </trk>\n` +
     `</gpx>\n`;
