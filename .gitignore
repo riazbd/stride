@@ -62,7 +62,6 @@ server.log
 /tool-results/
 /.zscripts/
 /mini-services/
-/tests/
 /examples/
 /agent-ctx/
 worklog.md
