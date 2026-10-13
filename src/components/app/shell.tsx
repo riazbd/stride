@@ -166,6 +166,7 @@ import { RecordSetupScreen } from "@/screens/record-setup";
 import { RecordingScreen } from "@/screens/recording";
 import { SaveActivityScreen } from "@/screens/save-activity";
 import { ManualActivityScreen } from "@/screens/manual";
+import { ImportGpxScreen } from "@/screens/import-gpx";
 import { SegmentsScreen } from "@/screens/segments";
 import { SegmentScreen } from "@/screens/segment";
 import { MapsScreen } from "@/screens/maps";
@@ -199,6 +200,7 @@ function renderScreen(s: Screen): React.ReactNode {
     case "recording": return <RecordingScreen />;
     case "saveActivity": return <SaveActivityScreen />;
     case "manual": return <ManualActivityScreen />;
+    case "importGpx": return <ImportGpxScreen />;
     case "segments": return <SegmentsScreen />;
     case "segment": return <SegmentScreen slug={s.slug} />;
     case "maps": return <MapsScreen />;
@@ -284,6 +286,11 @@ export function AppShell() {
   // phone back gesture / browser back pops screens & sheets instead of leaving
   useEffect(() => {
     bindHistoryBack();
+    // register the service worker for offline support / PWA installability
+    if ("serviceWorker" in navigator && (window as any).__strideSw !== true) {
+      (window as any).__strideSw = true;
+      navigator.serviceWorker.register("/sw.js").catch(() => { /* offline support unavailable */ });
+    }
   }, []);
 
   return (

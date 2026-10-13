@@ -1,6 +1,6 @@
 "use client";
 import React, { useState } from "react";
-import { Satellite, ChevronDown, Plus, Watch } from "lucide-react";
+import { Satellite, ChevronDown, Plus, FileUp, Watch } from "lucide-react";
 import { useNav } from "@/lib/nav";
 import { useRecorder } from "@/lib/recorder";
 import { ScreenHeader } from "@/components/app/shell";
@@ -36,9 +36,17 @@ export function RecordSetupScreen() {
         title="Record"
         back={false}
         right={
-          <button onClick={() => nav.push({ k: "manual" })} className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-muted text-[12.5px] font-bold active:scale-95 transition-transform">
-            <Plus size={15} /> Manual
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => nav.push({ k: "importGpx" })}
+              className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-muted text-[12.5px] font-bold active:scale-95 transition-transform"
+            >
+              <FileUp size={15} /> GPX
+            </button>
+            <button onClick={() => nav.push({ k: "manual" })} className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-muted text-[12.5px] font-bold active:scale-95 transition-transform">
+              <Plus size={15} /> Manual
+            </button>
+          </div>
         }
       />
 

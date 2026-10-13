@@ -139,10 +139,12 @@ export function MapView({
       attribution: ATTRIB,
       maxZoom: 20,
       maxNativeZoom: 16,
+      className: isDark ? "" : "stride-light-tiles",
     }).addTo(map);
     refTileRef.current = L.tileLayer(isDark ? DARK_REF : LIGHT_REF, {
       maxZoom: 20,
       maxNativeZoom: 16,
+      className: isDark ? "" : "stride-light-tiles",
     }).addTo(map);
   }, [ready, resolvedTheme]);
 

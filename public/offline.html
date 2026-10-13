@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#101013" />
+  <title>STRIDE — Offline</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #07060B;
+      color: #F5F5F7;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 32px;
+      text-align: center;
+    }
+    .badge {
+      width: 72px; height: 72px; border-radius: 20px;
+      background: #101013;
+      display: flex; align-items: center; justify-content: center;
+      margin-bottom: 24px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+    }
+    .badge svg { width: 40px; height: 40px; }
+    h1 { font-size: 22px; font-weight: 800; letter-spacing: 0.02em; margin-bottom: 8px; }
+    p { font-size: 14px; line-height: 1.55; color: #A1A1AA; max-width: 300px; margin-bottom: 28px; }
+    button {
+      appearance: none; border: none; cursor: pointer;
+      background: #FC4C02; color: #fff;
+      height: 48px; padding: 0 28px; border-radius: 999px;
+      font-size: 15px; font-weight: 800; letter-spacing: 0.04em;
+      transition: transform 0.15s ease, opacity 0.15s ease;
+    }
+    button:active { transform: scale(0.96); }
+    button:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+  <div class="badge">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M4 13a8 8 0 1 1 16 0" stroke="#FC4C02" stroke-width="2.4" stroke-linecap="round"/>
+      <path d="M2.5 15.5 7 13.5l4.5-3 5 3.5 5-1.5" stroke="#FC4C02" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      <circle cx="12" cy="17" r="1.9" fill="#FC4C02"/>
+    </svg>
+  </div>
+  <h1>You&rsquo;re offline</h1>
+  <p>STRIDE needs a connection to sync your feed and activities. Your map tiles and app shell are still cached. GPS recording will upload when you&rsquo;re back online.</p>
+  <button onclick="location.reload()">Try Again</button>
+</body>
+</html>

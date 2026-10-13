@@ -37,6 +37,7 @@ const table: [string, string, H][] = [
 
   ["GET", "activities/:id", (c) => activities.getActivity(c.params.id, c.athleteId)],
   ["GET", "activities/:id/analysis", (c) => activities.analysis(c.params.id, c.athleteId)],
+  ["GET", "activities/:id/gpx", (c) => activities.exportGpx(c.params.id, c.athleteId)],
   ["POST", "activities", (c) => activities.createActivity(c.athleteId, c.body)],
   ["PATCH", "activities/:id", (c) => activities.updateActivity(c.params.id, c.athleteId, c.body)],
   ["DELETE", "activities/:id", (c) => activities.deleteActivity(c.params.id, c.athleteId)],

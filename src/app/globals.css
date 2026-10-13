@@ -61,7 +61,7 @@
   --secondary: #f2f2f3;
   --secondary-foreground: #242427;
   --muted: #f5f5f6;
-  --muted-foreground: #85858c;
+  --muted-foreground: #74747c;
   --accent: #f5f5f6;
   --accent-foreground: #242427;
   --destructive: #d5302a;
@@ -124,6 +124,9 @@
   --sidebar-border: #2a2b31;
   --sidebar-ring: #ff5a1f;
 }
+
+/* light-mode map tiles: ArcGIS Light Gray is very pale — give it a gentle lift */
+.stride-light-tiles { filter: saturate(1.25) contrast(1.12); }
 
 @layer base {
   * {

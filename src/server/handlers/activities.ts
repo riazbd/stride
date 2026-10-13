@@ -472,3 +472,52 @@ export async function addComment(id: string, viewerId: string | null, body: any)
     },
   });
 }
+
+// GET /api/activities/:id/gpx — download the activity track as a GPX 1.1 file
+export async function exportGpx(id: string, viewerId: string | null): Promise<Response> {
+  if (!viewerId) return err(401, "Sign in required");
+  const act = await visibleActivity(id, viewerId);
+  if (!act) return err(404, "Activity not found");
+  if (!act.track) return err(404, "This activity has no GPS track to export");
+  const pts = decodeTrack(act.track.points);
+  if (pts.length < 2) return err(422, "Track too short to export");
+
+  // privacy zone: same clipping as getActivity for non-owners
+  let track = pts;
+  if (viewerId !== act.athleteId && (act.athlete as any).privacyRadiusM > 0) {
+    const radius = (act.athlete as any).privacyRadiusM as number;
+    let s = 0, e = track.length - 1;
+    while (s < track.length && haversineM([track[0].lng, track[0].lat], [track[s].lng, track[s].lat]) < radius) s++;
+    while (e >= 0 && haversineM([track[track.length - 1].lng, track[track.length - 1].lat], [track[e].lng, track[e].lat]) < radius) e--;
+    track = e > s ? track.slice(s, e + 1) : [];
+  }
+  if (track.length < 2) return err(422, "Track hidden by privacy zone");
+
+  const startMs = act.startDate.getTime();
+  const esc = (s: string) => s.replace(/[<>&'"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" }[c] as string));
+  const name = esc(act.title ?? `${act.sport.replace(/_/g, " ")} activity`);
+  const iso = (t: number) => new Date(startMs + t * 1000).toISOString();
+  const rows = track
+    .map(
+      (p) =>
+        `      <trkpt lat="${p.lat.toFixed(6)}" lon="${p.lng.toFixed(6)}">` +
+        `<ele>${p.ele.toFixed(1)}</ele>` +
+        `<time>${iso(p.t)}</time>` +
+        `</trkpt>`
+    )
+    .join("\n");
+  const xml =
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<gpx version="1.1" creator="STRIDE" xmlns="http://www.topografix.com/GPX/1/1">\n` +
+    `  <metadata>\n    <name>${name}</name>\n    <time>${track[0].t ? iso(track[0].t) : new Date(startMs).toISOString()}</time>\n  </metadata>\n` +
+    `  <trk>\n    <name>${name}</name>\n    <type>${act.sport}</type>\n    <trkseg>\n${rows}\n    </trkseg>\n  </trk>\n` +
+    `</gpx>\n`;
+  const file = `stride-${act.startDate.toISOString().slice(0, 10)}-${act.id.slice(-4)}.gpx`;
+  return new Response(xml, {
+    headers: {
+      "content-type": "application/gpx+xml; charset=utf-8",
+      "content-disposition": `attachment; filename="${file}"`,
+      "cache-control": "no-store",
+    },
+  });
+}

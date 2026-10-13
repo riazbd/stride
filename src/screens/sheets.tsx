@@ -1,7 +1,7 @@
 "use client";
 import React, { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ThumbsUp, Trash2, Pencil, Share2, Flag, Loader2, Send, Check, Target, Lock } from "lucide-react";
+import { ThumbsUp, Trash2, Pencil, Share2, Flag, Loader2, Send, Check, Target, Lock, FileDown } from "lucide-react";
 import { Drawer, DrawerContent, DrawerHeader, DrawerTitle } from "@/components/ui/drawer";
 import { api, Activity } from "@/lib/api";
 import { useNav, useUI } from "@/lib/nav";
@@ -191,6 +191,15 @@ export function ActivityOptionsSheet({ activityId }: { activityId: string }) {
               <SheetAction icon={Trash2} label="Delete activity" danger onClick={del} />
             </>
           )}
+          <SheetAction
+            icon={FileDown}
+            label="Export GPX file"
+            onClick={() => {
+              window.location.assign(`/api/activities/${activityId}/gpx`);
+              toast({ description: "GPX file downloading…" });
+              nav.closeSheet();
+            }}
+          />
           <SheetAction
             icon={Share2}
             label="Share…"

@@ -8,6 +8,7 @@ export type Screen =
   | { k: "recording" }
   | { k: "saveActivity" }
   | { k: "manual" }
+  | { k: "importGpx" }
   | { k: "postComposer" }
   | { k: "segments" }
   | { k: "segment"; slug: string }
